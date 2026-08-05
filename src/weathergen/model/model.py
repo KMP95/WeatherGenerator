@@ -576,7 +576,8 @@ class Model(torch.nn.Module):
         ssl_losses_cfgs = [
             v
             for _, v in cf.training_config.losses.items()
-            if v.type == "LossLatentSSLStudentTeacher" and v.get("enabled", True)
+            if v.type in ("LossLatentSSLStudentTeacher", "LossLatentSSLLeJEPA")
+            and v.get("enabled", True)
         ]
 
         # TODO: support multiple LossLatentSSLStudentTeacher terms

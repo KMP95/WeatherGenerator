@@ -88,7 +88,9 @@ def prepare_encoder_teacher(model: nn.Module, training_cfg, override_cfg) -> Non
     # Create fresh latent heads from student's SSL config
     model.latent_heads = nn.ModuleDict()
     ssl_losses = [
-        v for v in training_cfg.losses.values() if v.type == "LossLatentSSLStudentTeacher"
+        v
+        for v in training_cfg.losses.values()
+        if v.type in ("LossLatentSSLStudentTeacher", "LossLatentSSLLeJEPA")
     ]
     for ssl_loss in ssl_losses:
         for name, conf in ssl_loss.loss_fcts.items():

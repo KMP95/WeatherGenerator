@@ -1,0 +1,30 @@
+# Reference temporal-JEPA pretraining chain (Seb's email, 2026-07):
+#   gjl6a0kb -> uahdb9yl -> n0t6ejuo
+# All three are the same TJEPA job, restarted; run_history in model_n0t6ejuo.json confirms
+# the ordering. Plot them together to see the full pretraining trajectory.
+#
+# Usage (from the WeatherGenerator checkout):
+#   export WEATHERGEN_PRIVATE_CONF=../WeatherGenerator-private/hpc/laptop/config/paths.yml
+#   uv run plot_train -fy config/plot_tjepa_reference.yml -o ./plots --legend-outside
+#
+# Each run_id listed here needs BOTH of these present under path_shared_working_dir:
+#   results/<run_id>/<run_id>_train_metrics.json    <- the curves
+#   models/<run_id>/model_<run_id>.json             <- the frozen config (21 KB)
+# The model json is mandatory: TrainLogger.read() loads it to resolve stream names
+# before it touches the metrics. Fetch any missing ones from /e/scratch/weatherai.
+#
+# `slurm_id: 0` means "not recorded" -- it is only used for the plot label.
+
+train:
+  plot:
+    gjl6a0kb:
+      slurm_id: 0
+      description: "TJEPA pretrain, multi-data, all years (jupiter, leg 1)"
+
+    uahdb9yl:
+      slurm_id: 0
+      description: "TJEPA pretrain, continued (jupiter, leg 2)"
+
+    n0t6ejuo:
+      slurm_id: 0
+      description: "TJEPA pretrain, continued (santis, leg 3, final encoder)"

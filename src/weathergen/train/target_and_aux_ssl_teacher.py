@@ -45,7 +45,7 @@ class EncoderTeacher(TargetAndAuxModuleBase):
         losses_cfg = [
             v.loss_fcts
             for k, v in training_cfg.losses.items()
-            if v.type == "LossLatentSSLStudentTeacher"
+            if v.type in ("LossLatentSSLStudentTeacher", "LossLatentSSLLeJEPA")
         ]
         # TODO: support multiple LossLatentSSLStudentTeacher loss terms
         self.postprocess_targets = get_target_postprocessing(losses_cfg[0], training_cfg, **kwargs)
