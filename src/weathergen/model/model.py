@@ -347,6 +347,9 @@ class Model(torch.nn.Module):
         self.latent_pre_norm = None
         self.deep_ssl_fusion: DeepSSLFusion | None = None
         self.deep_ssl_level_projections: nn.ModuleDict | None = None
+        # Optional learnable projector applied before the LeJEPA SIGReg term. Stays None
+        # unless training_config.sigreg.projector.mode == "learned".
+        self.sigreg_projector: nn.Module | None = None
         # auxiliary tokens
         self.class_token_idxs = list(
             range(cf.num_register_tokens, cf.num_register_tokens + cf.num_class_tokens)
@@ -629,6 +632,23 @@ class Model(torch.nn.Module):
                     [nn.Linear(out_dim, out_dim, bias=False) for _ in range(num_levels)]
                 )
 
+        # LeJEPA: optional learnable projector before SIGReg (Balestriero & LeCun 2025 apply
+        # SIGReg to a low-dimensional projector output, not to the raw embedding).
+        # It must live on the model, not on the loss module: loss modules are plain classes,
+        # so parameters they own would never reach the optimizer or DDP.
+        sigreg_cfg = cf.training_config.get("sigreg", None) or {}
+        proj_cfg = sigreg_cfg.get("projector", None) or {}
+        if proj_cfg.get("mode", "none") == "learned":
+            dims = [cf.ae_global_dim_embed, *list(proj_cfg.get("hidden_dims", [2048])),
+                    int(proj_cfg.get("out_dim", 128))]
+            layers: list[nn.Module] = []
+            for i in range(len(dims) - 1):
+                layers.append(nn.Linear(dims[i], dims[i + 1], bias=(i == len(dims) - 2)))
+                if i < len(dims) - 2:
+                    layers.append(nn.LayerNorm(dims[i + 1]))
+                    layers.append(nn.GELU())
+            self.sigreg_projector = nn.Sequential(*layers)
+
         return self
 
     @staticmethod
@@ -813,6 +833,12 @@ class Model(torch.nn.Module):
 
         latent_state = self.tokens_to_latent_state(tokens_post_norm, tokens)
         output.add_latent_prediction(step, "latent_state", latent_state)
+
+        # LeJEPA: expose the projected latent so the SIGReg term can consume it.
+        if self.sigreg_projector is not None:
+            output.add_latent_prediction(
+                step, "sigreg_proj", self.sigreg_projector(latent_state.patch_tokens)
+            )
 
         # latent predictions for SSL training
         for name, head in self.latent_heads.items():

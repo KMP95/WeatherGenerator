@@ -244,13 +244,38 @@ training_config:
   # and changes the effective batch size relative to the baseline.
   sigreg:
     weight: 0.2
+
+    # cell   : one test per HEALPix cell, samples = weather states (views x ranks).
+    # parent : average the 4^k children of each level-(L-k) cell first, then one test
+    #          per parent cell. k = parent_levels_up. Less noise, keeps locality.
+    # global : average over ALL cells -> one vector per weather state, one test.
+    #          Exact analogue of the image setting (one image -> one embedding).
+    # pooled : every (state, cell) pair is a sample. Reproduces
+    #          upstream/shmh40/dev/lejepa-per-cell. Baseline only -- blind to collapse
+    #          across weather states.
     aggregation: cell
+    parent_levels_up: 1
+
+    # Which tensor to regularize. "latent_state" = raw encoder output (2048-dim).
+    # Set to "sigreg_proj" when projector.mode is "learned".
     source: latent_state
+
+    projector:
+      # none    : SIGReg on the raw ae_global_dim_embed (2048) representation.
+      # random  : fixed, non-learnable Gaussian sketch to out_dim. No model change.
+      # learned : MLP built on the model (model.py), published as "sigreg_proj".
+      #           The paper uses a learned projector with a SMALL out_dim (16-128) and
+      #           reports degrading accuracy as it grows; establishing Gaussianity in
+      #           2048 dims from a handful of samples is much harder than in 128.
+      mode: none
+      out_dim: 128
+      hidden_dims: [2048]
+      seed: 1234
+
     num_projections: 256
     knots: 17
     t_max: 3.0
-    num_cells: 256
-    max_dims: 0
+    num_cells: 256        # cells/groups subsampled per step (0 = use all)
     min_samples: 4
     warmup_steps: 0
 

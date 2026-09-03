@@ -80,6 +80,8 @@ def prepare_encoder_teacher(model: nn.Module, training_cfg, override_cfg) -> Non
     # Strip deep SSL fusion (teacher uses independent per-level prediction, not fusion)
     model.deep_ssl_fusion = None
     model.deep_ssl_level_projections = None
+    # SIGReg regularizes the student only; the teacher needs no projector.
+    model.sigreg_projector = None
 
     # Ensure latent_pre_norm exists (teacher may not have had SSL training)
     if model.latent_pre_norm is None:
