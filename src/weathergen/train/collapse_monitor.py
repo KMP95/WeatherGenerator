@@ -14,6 +14,7 @@ This module implements metrics to detect representation collapse during self-sup
 - Effective Rank (RankMe): Entropy of normalized singular values
 - Singular Value Spectrum: Top-k singular values and concentration ratio
 - Per-Dimension Variance: Min/mean/max variance across embedding dimensions
+- Per-Cell Across-Batch Variance: variance over weather states, held per HEALPix cell
 - Prototype Entropy: Normalized entropy of DINO prototype assignments
 - EMA Beta: Current teacher momentum value
 
@@ -86,6 +87,7 @@ class CollapseMonitor:
         self.effective_rank_config = metrics_config.get("effective_rank", {})
         self.singular_values_config = metrics_config.get("singular_values", {})
         self.dimension_variance_config = metrics_config.get("dimension_variance", {})
+        self.cell_batch_variance_config = metrics_config.get("cell_batch_variance", {})
         self.prototype_entropy_config = metrics_config.get("prototype_entropy", {})
         self.ema_beta_config = metrics_config.get("ema_beta", {})
 
@@ -93,11 +95,13 @@ class CollapseMonitor:
         self._validate_tensor_source(self.effective_rank_config, "effective_rank")
         self._validate_tensor_source(self.singular_values_config, "singular_values")
         self._validate_tensor_source(self.dimension_variance_config, "dimension_variance")
+        self._validate_tensor_source(self.cell_batch_variance_config, "cell_batch_variance")
 
         # Validate forecast_aggregation values
         self._validate_forecast_aggregation(self.effective_rank_config, "effective_rank")
         self._validate_forecast_aggregation(self.singular_values_config, "singular_values")
         self._validate_forecast_aggregation(self.dimension_variance_config, "dimension_variance")
+        self._validate_forecast_aggregation(self.cell_batch_variance_config, "cell_batch_variance")
 
         # Cache for accumulating metrics between log intervals
         self._metrics_cache: defaultdict[str, list[float]] = defaultdict(list)
@@ -366,6 +370,30 @@ class CollapseMonitor:
                     for key, value in var_metrics.items():
                         metrics[f"collapse.{name}.{key}"] = value
 
+        # Compute per-cell across-batch variance
+        if self.cell_batch_variance_config.get("enabled", True):
+            aggregation = self.cell_batch_variance_config.get("forecast_aggregation", "all")
+            tensors = self._get_tensors_to_monitor(
+                student_latent, teacher_latent, self.cell_batch_variance_config
+            )
+
+            for name, tensor in tensors.items():
+                if tensor is None:
+                    continue
+
+                if isinstance(tensor, list):
+                    seq_metrics = self._compute_sequence_dict_metrics(
+                        tensor,
+                        self._compute_cell_batch_variance,
+                        f"collapse.{name}",
+                        aggregation,
+                    )
+                    metrics.update(seq_metrics)
+                else:
+                    cbv_metrics = self._compute_cell_batch_variance(tensor)
+                    for key, value in cbv_metrics.items():
+                        metrics[f"collapse.{name}.{key}"] = value
+
         # Compute prototype entropy (DINO only)
         if (
             self.prototype_entropy_config.get("enabled", True)
@@ -575,6 +603,93 @@ class CollapseMonitor:
             "var_min": var_per_dim.min().item(),
             "var_mean": var_per_dim.mean().item(),
             "var_max": var_per_dim.max().item(),
+        }
+
+    def _gather_batch_across_ranks(self, z: torch.Tensor) -> torch.Tensor:
+        """
+        Concatenate the batch dimension of `z` across all ranks.
+
+        Necessary because the batch is one weather state per GPU in the shipped configs
+        (`model_input.*.num_samples: 1`), and a variance over a single sample is
+        undefined. After gathering, the sample count is world_size * num_samples.
+
+        Every rank runs this: `_compute_collapse_metrics` is called inside the training
+        loop with no is_root guard, and `should_compute` keys off the synchronised istep,
+        so the collective cannot deadlock. Gradients are irrelevant here, so the plain
+        (non-differentiable) all_gather is the right one.
+        """
+        if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+            return z
+        world_size = torch.distributed.get_world_size()
+        if world_size == 1:
+            return z
+        z = z.contiguous()
+        buf = [torch.empty_like(z) for _ in range(world_size)]
+        torch.distributed.all_gather(buf, z)
+        return torch.cat(buf, dim=0)
+
+    def _compute_cell_batch_variance(self, z: torch.Tensor) -> dict[str, float]:
+        """
+        Variance across weather states, computed separately for each HEALPix cell.
+
+        This is the diagnostic `dimension_variance` cannot give. That metric flattens
+        [B, N, D] to [B*N, D] first, so it reports variance across cells AND batch mixed
+        together. A representation that is identical for every weather state but varies
+        over the globe -- the collapse mode that matters when SIGReg is applied along the
+        wrong axis -- still shows a large variance there and looks healthy.
+
+        Here the reduction is over B only, holding the cell fixed, which is the same axis
+        the per-cell SIGReg term regularises.
+
+        `batch_to_cell_var_ratio` is the headline number: across-batch variance divided by
+        across-cell variance. It falls towards 0 exactly in the failure mode above, and
+        stays O(1) for a representation that genuinely distinguishes weather states.
+
+        Args:
+            z: Latent representations [B, N, D]. A 2D tensor has no cell axis and is
+               skipped -- use dimension_variance for that case.
+
+        Returns:
+            Dictionary with the per-cell variance summary, or {} if not computable.
+        """
+        z = z.detach()
+        if z.dtype in (torch.bfloat16, torch.float16):
+            z = z.float()
+
+        if z.ndim != 3:
+            return {}
+        if z.numel() == 0:
+            logger.warning("Empty tensor in cell-batch variance computation")
+            return {}
+        if torch.isnan(z).any() or torch.isinf(z).any():
+            logger.warning("NaN/Inf values in tensor for cell-batch variance computation")
+            return {}
+
+        z = self._gather_batch_across_ranks(z)
+        num_states = z.shape[0]
+        if num_states < 2:
+            logger.warning(
+                "Need at least 2 weather states for cell-batch variance, got "
+                f"{num_states}. Raise model_input.*.num_samples or use more ranks."
+            )
+            return {}
+
+        # Across-batch variance, per cell and per dimension -> [N, D].
+        var_batch = z.var(dim=0, unbiased=True)
+        # Across-cell variance of the per-cell mean state -> [D]. Reference scale.
+        var_cells = z.mean(dim=0).var(dim=0, unbiased=True)
+
+        var_batch_per_cell = var_batch.mean(dim=-1)  # [N]
+        mean_batch = var_batch.mean()
+        mean_cells = var_cells.mean()
+
+        return {
+            "cell_batch_var_mean": mean_batch.item(),
+            "cell_batch_var_min": var_batch_per_cell.min().item(),
+            "cell_batch_var_max": var_batch_per_cell.max().item(),
+            "cell_var_mean": mean_cells.item(),
+            "batch_to_cell_var_ratio": (mean_batch / (mean_cells + 1e-12)).item(),
+            "num_states": float(num_states),
         }
 
     def _compute_prototype_entropy(self, probs: torch.Tensor) -> float:

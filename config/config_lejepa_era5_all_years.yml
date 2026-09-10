@@ -157,6 +157,15 @@ train_logging:
         enabled: true
         tensor_source: "both"  # cheap to compute, good early indicator
         forecast_aggregation: "all"
+      cell_batch_variance:
+        # Variance over weather states, held per HEALPix cell -- the axis the per-cell
+        # SIGReg term regularises. dimension_variance flattens [B, N, D] to [B*N, D] and
+        # so cannot see a representation that is constant across states but varies over
+        # the globe; batch_to_cell_var_ratio goes to 0 exactly in that case.
+        # Gathers the batch across ranks, because num_samples is 1 per GPU.
+        enabled: true
+        tensor_source: "both"
+        forecast_aggregation: "all"
       prototype_entropy:
         enabled: true  # only applies to DINO
       ema_beta:
