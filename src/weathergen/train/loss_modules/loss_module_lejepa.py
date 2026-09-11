@@ -59,7 +59,7 @@ from weathergen.utils.train_logger import Stage
 
 logger = logging.getLogger(__name__)
 
-_AGGREGATIONS = ("cell", "parent", "global", "pooled")
+_AGGREGATIONS = ("cell", "parent", "global", "pooled", "class_token")
 
 
 def _gaussian_quadrature(knots: int, t_max: float, device, dtype):
@@ -146,7 +146,7 @@ class LossLatentSSLLeJEPA(LossLatentSSLStudentTeacher):
 
         sigreg:
           weight: 0.2
-          aggregation: cell        # cell | parent | global | pooled
+          aggregation: cell        # cell | parent | global | pooled | class_token
           parent_levels_up: 1      # only for aggregation=parent
           source: latent_state     # latent_state | sigreg_proj | <loss_fcts head name>
           num_projections: 256
@@ -213,7 +213,24 @@ class LossLatentSSLLeJEPA(LossLatentSSLStudentTeacher):
         latent = preds.latent[0]
         if self.source == "latent_state":
             state = latent.get("latent_state", None)
-            return None if state is None else state.patch_tokens
+            if state is None:
+                return None
+            if self.aggregation == "class_token":
+                # The faithful analogue of the paper's setting: LeJEPA applies SIGReg to
+                # whatever `forward()` returns, which for a ViT is the class token -- a
+                # learned query that has attended to every patch. `global` mean-pools the
+                # cells instead, which is fixed and unweighted and cannot learn what to
+                # attend to. The class token is produced by the encoder's auxiliary
+                # queries (encoder.q_aux) and is only non-empty when the config sets
+                # num_class_tokens >= 1.
+                ct = getattr(state, "class_token", None)
+                if ct is None or ct.numel() == 0 or ct.shape[1] == 0:
+                    raise ValueError(
+                        "sigreg.aggregation='class_token' needs num_class_tokens >= 1 in "
+                        "the model config; the encoder currently emits no class token."
+                    )
+                return ct
+            return state.patch_tokens
         return latent.get(self.source, None)
 
     def _apply_random_projector(self, z: torch.Tensor) -> torch.Tensor:
@@ -229,6 +246,12 @@ class LossLatentSSLLeJEPA(LossLatentSSLStudentTeacher):
         """Collapse the cell axis according to `aggregation`. Returns [V, G, D]."""
         v, c, d = z.shape
         if self.aggregation == "cell":
+            return z
+        if self.aggregation == "class_token":
+            # Already one vector per weather state per class token: the middle axis is the
+            # class tokens, not cells, so there is nothing to collapse. With the usual
+            # num_class_tokens=1 this is a single Gaussianity test over the batch, which is
+            # exactly the paper's setting.
             return z
         if self.aggregation == "global":
             return z.mean(dim=1, keepdim=True)
