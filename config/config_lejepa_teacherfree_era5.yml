@@ -1,0 +1,398 @@
+# (C) Copyright 2025 WeatherGenerator contributors.
+#
+# This software is licensed under the terms of the Apache Licence Version 2.0
+# which can be obtained at http://www.apache.org/licenses/LICENSE-2.0.
+#
+# In applying this licence, ECMWF does not waive the privileges and immunities
+# granted to it by virtue of its status as an intergovernmental organisation
+# nor does it submit to any jurisdiction.
+
+embed_orientation: "channels"
+embed_unembed_mode: "block"
+embed_dropout_rate: 0.1
+
+ae_local_dim_embed: 1024
+ae_local_num_blocks: 4
+ae_local_num_heads: 16
+ae_local_dropout_rate: 0.1
+ae_local_with_qk_lnorm: True
+
+ae_local_num_queries: 1
+ae_local_queries_per_cell: False
+ae_adapter_num_heads: 16
+ae_adapter_embed: 128
+ae_adapter_with_qk_lnorm: True
+ae_adapter_with_residual: True
+ae_adapter_dropout_rate: 0.1
+
+ae_global_dim_embed: 2048
+ae_global_num_blocks: 5
+ae_global_num_heads: 16
+ae_global_dropout_rate: 0.1
+ae_global_with_qk_lnorm: True
+# TODO: switching to < 1 triggers triton-related issues.
+# See https://github.com/ecmwf/WeatherGenerator/issues/1050
+ae_global_att_dense_rate: 1.0
+ae_global_block_factor: 64
+ae_global_mlp_hidden_factor: 4
+ae_global_trailing_layer_norm: True
+
+ae_aggregation_num_blocks: 5
+ae_aggregation_num_heads: 16
+ae_aggregation_dropout_rate: 0.1
+ae_aggregation_with_qk_lnorm: True
+ae_aggregation_att_dense_rate: 1.0
+ae_aggregation_block_factor: 64
+ae_aggregation_mlp_hidden_factor: 4
+
+decoder_type: PerceiverIOCoordConditioning # CrossAttentionAdaNormConditioning
+pred_adapter_kv: False
+pred_self_attention: True
+pred_dyadic_dims: False
+pred_mlp_adaln: True
+num_class_tokens: 0
+num_register_tokens: 64
+
+# noise before predictor in JEPA
+noise_pre_predictor_std: 0
+
+# number of steps offset applied to first target window; if set to zero and forecast_steps=0 then
+# one is training an auto-encoder
+fe_num_blocks: 6
+fe_num_heads: 16
+fe_dropout_rate: 0.1
+fe_with_qk_lnorm: True
+fe_layer_norm_after_blocks: [7]  # Index starts at 0. Thus, [3] adds a LayerNorm after the fourth layer
+fe_impute_latent_noise_std: 0.0  # 1e-4
+# currently fixed to 1.0 (due to limitations with flex_attention and triton)
+forecast_att_dense_rate: 1.0
+with_step_conditioning: True # False
+
+healpix_level: 5
+# Use 2D RoPE instead of traditional global positional encoding
+# When True: uses 2D RoPE based on healpix cell coordinates (lat/lon)
+# When False: uses traditional pe_global positional encoding
+rope_2D: True 
+mlp_type: swiglu
+use_xsa: True
+
+with_mixed_precision: True
+with_flash_attention: True
+compile_model: False
+with_fsdp: False
+ddp_find_unused_parameters: False
+attention_dtype: bf16
+mixed_precision_dtype: bf16
+mlp_norm_eps: 1e-5
+norm_eps: 1e-4
+
+latent_noise_kl_weight: 0.0 # 1e-5
+latent_noise_gamma: 2.0
+latent_noise_saturate_encodings: 5 
+latent_noise_use_additive_noise: False
+latent_noise_deterministic_latents: True
+
+freeze_modules: ""
+
+norm_type: "LayerNorm"
+qk_norm_type: "RMSNorm"
+# type of zarr_store
+zarr_store: "zip" # "zarr" for LocalStore, "zip" for ZipStore
+
+#####################################
+
+streams_directory: "./config/streams/pretrain_era5_all_years/"
+streams: ???
+
+general:
+
+  # mutable parameters
+  istep: 0
+  rank: ???
+  world_size: ???
+
+  # local_rank, 
+  # with_ddp,
+  # data_path_*, 
+  # model_path, 
+  # run_path, 
+  # path_shared_
+
+  multiprocessing_method: "fork"
+
+  run_id: ???
+  run_history: []
+
+# logging frequency in the training loop (in number of batches)
+train_logging:
+  terminal: 100
+  metrics: 20
+  checkpoint: 500
+  log_grad_norms: False
+
+  # Collapse monitoring for SSL training (JEPA/DINO/iBOT)
+  # Detects representation collapse via various metrics
+  # For forecasting, supports sequences of latents with per-step and aggregate metrics
+  # Enabled here (the TJEPA reference runs gjl6a0kb/uahdb9yl/n0t6ejuo all ran with this
+  # off, so there are no rank/variance diagnostics for them). Turn it on in the TJEPA
+  # baseline too if you want a like-for-like collapse comparison.
+  collapse_monitoring:
+    enabled: True
+    compute_frequency: 100  # batches between metric computations
+    log_frequency: 100      # batches between metric logging
+    metrics:
+      effective_rank:
+        enabled: true
+        tensor_source: "both"  # "student", "teacher", or "both"
+        sample_size: 2048      # max samples for SVD (0 = no sampling)
+        # For forecasting sequences: "all" (per-step + aggregates),
+        # "aggregate_only" (mean/min/max/degradation), "per_step_only"
+        forecast_aggregation: "all"
+      singular_values:
+        enabled: true
+        tensor_source: "both"
+        sample_size: 2048
+        forecast_aggregation: "all"
+      dimension_variance:
+        enabled: true
+        tensor_source: "both"  # cheap to compute, good early indicator
+        forecast_aggregation: "all"
+      cell_batch_variance:
+        # Variance over weather states, held per HEALPix cell -- the axis the per-cell
+        # SIGReg term regularises. dimension_variance flattens [B, N, D] to [B*N, D] and
+        # so cannot see a representation that is constant across states but varies over
+        # the globe; batch_to_cell_var_ratio goes to 0 exactly in that case.
+        # Gathers the batch across ranks, because num_samples is 1 per GPU.
+        enabled: true
+        tensor_source: "both"
+        forecast_aggregation: "all"
+      prototype_entropy:
+        enabled: true  # only applies to DINO
+      ema_beta:
+        enabled: true
+
+# parameters for data loading
+data_loading :
+
+  num_workers: 12
+  rng_seed: ???
+
+
+# config for training
+training_config:
+
+  # training_mode: "masking", "student_teacher", "latent_loss"
+  training_mode: ["student_teacher"]
+
+  # Shift teacher by one 6h forecast interval. This is in time-window indices;
+  # with time_window_step=01:00:00, 6 indices = 6 hours.
+  teacher_time_offset: 1
+
+  # Deep self-supervision (V-JEPA 2.1 style): compute SSL loss at multiple encoder depths.
+  # When enabled, intermediate encoder representations are tapped and used as additional
+  # targets/predictions for the SSL loss. Disabled by default (empty tap_after).
+  deep_ssl:
+    enabled: true
+    tap_after:                     # named tap points (final output always included implicitly)
+      - local2global               # after local-to-global adapter, before global attention
+      - "global:0"                 # after 1st global layer (0-indexed)
+      - "global:1"                 # after 2nd global layer
+    fusion_hidden_factor: 4        # MLP hidden dim = factor * dim_embed
+    level_weights: [0.25, 0.25, 0.25, 0.25]  # per-level loss weights (len = num taps + 1)
+
+  # Temporal JEPA predicts the full future teacher latent, so no separate context loss is needed.
+  context_loss:
+    enabled: false
+
+  num_mini_epochs: 96
+  samples_per_mini_epoch: 8192
+  shuffle: True
+
+  start_date: 1979-01-01T00:00
+  end_date: 2022-12-31T00:00
+
+  time_window_step: 06:00:00
+  time_window_len: 06:00:00
+
+  window_offset_prediction : 0
+  
+  learning_rate_scheduling :
+    lr_start: 1e-6
+    lr_max: 8e-5
+    lr_final_decay: 1e-6
+    lr_final: 0.0
+    num_steps_warmup: 512
+    num_steps_cooldown: 1024
+    policy_warmup: "cosine"
+    policy_decay: "constant"
+    policy_cooldown: "linear"
+    parallel_scaling_policy: "sqrt"
+
+  optimizer:
+    grad_clip: 0.25
+    weight_decay: 0.05
+    adamw :
+      # parameters are scaled by number of DDP workers
+      beta1 : 0.9875 # at B=8 beta1 =0.9
+      beta2 : 0.994 # at B=8 beta1 approx 0.95
+      eps : 2e-08
+
+  # SIGReg regularizer added on top of the temporal-JEPA objective.
+  # Total loss = JEPA (unchanged) + sigreg.weight * SIGReg(student latents).
+  #
+  # aggregation: "cell"   -> sample axis = weather states (views x DDP ranks), one
+  #                          Gaussianity test per HEALPix cell. Rules out the
+  #                          "frozen climatology field" solution.
+  #              "pooled" -> sample axis = views x cells, i.e. the behaviour of
+  #                          upstream/shmh40/dev/lejepa-per-cell. Use as a baseline.
+  #
+  # NOTE on sample count with aggregation=cell: samples per cell = model_input
+  # num_samples x world_size. With num_samples=1 (kept identical to the TJEPA
+  # baseline for comparability) you need >= 4 GPUs to clear min_samples. Raising
+  # num_samples to 2 doubles the sample axis but also doubles activation memory
+  # and changes the effective batch size relative to the baseline.
+  sigreg:
+    weight: 0.2
+
+    # cell   : one test per HEALPix cell, samples = weather states (views x ranks).
+    # parent : average the 4^k children of each level-(L-k) cell first, then one test
+    #          per parent cell. k = parent_levels_up. Less noise, keeps locality.
+    # global : average over ALL cells -> one vector per weather state, one test.
+    #          Exact analogue of the image setting (one image -> one embedding).
+    # pooled : every (state, cell) pair is a sample. Reproduces
+    #          upstream/shmh40/dev/lejepa-per-cell. Baseline only -- blind to collapse
+    #          across weather states.
+    aggregation: cell
+    parent_levels_up: 1
+
+    # Which tensor to regularize. "latent_state" = raw encoder output (2048-dim).
+    # Set to "sigreg_proj" when projector.mode is "learned".
+    source: latent_state
+
+    projector:
+      # none    : SIGReg on the raw ae_global_dim_embed (2048) representation.
+      # random  : fixed, non-learnable Gaussian sketch to out_dim. No model change.
+      # learned : MLP built on the model (model.py), published as "sigreg_proj".
+      #           The paper uses a learned projector with a SMALL out_dim (16-128) and
+      #           reports degrading accuracy as it grows; establishing Gaussianity in
+      #           2048 dims from a handful of samples is much harder than in 128.
+      mode: none
+      out_dim: 128
+      hidden_dims: [2048]
+      seed: 1234
+
+    num_projections: 256
+    knots: 17
+    t_max: 3.0
+    num_cells: 256        # cells/groups subsampled per step (0 = use all)
+    min_samples: 4
+    warmup_steps: 0
+
+  losses : {
+    "student-teacher": {
+        enabled: True,
+        type: LossLatentSSLLeJEPA,
+        weight: 1.0,
+        loss_fcts : {
+          "JEPA": {
+            'weight': 1, "loss_extra_args": {temporal: true}, "out_dim": 2048, "head": transformer,
+            "num_blocks": 6, "num_heads": 16, "with_qk_lnorm": True, "intermediate_dim": 1024, 
+            "dropout_rate": 0.1,
+            target_source_correspondence: {0 : {0 : "independent"} },
+        },
+        },
+        # Teacher-free (family E2). Targets come from the LIVE model with gradients
+        # flowing through both branches -- no EMA copy, no stop-gradient. Collapse is
+        # prevented by SIGReg alone, which is the paper's central claim.
+        # See src/weathergen/train/target_and_aux_shared_encoder.py.
+        #
+        # Note there is no model_param_overrides here: with one shared encoder the target
+        # branch is the student, so it necessarily has the same predictor head. The EMA
+        # variant overrides the teacher's head to `identity` because it is a separate copy.
+        target_and_aux_calc: { "SharedEncoderTarget" : { } }
+      }
+  }
+  
+  model_input: {
+    "random_easy" : {
+      # Full-field student input; the prediction task is temporal, not spatial masking.
+      masking_strategy: "forecast",
+      num_samples: 1,
+      num_steps_input: 1,
+      masking_strategy_config : {},
+    },
+  }
+
+  target_input: {
+    "random_easy_target" : {
+      masking_strategy: "forecast",
+      num_samples: 1,
+      masking_strategy_config : {},
+    },
+  }
+
+  forecast :
+    time_step: 00:00:00
+    num_steps: 0
+    policy: null
+
+
+# validation config; full validation config is merge of training and validation config
+validation_config: 
+
+  samples_per_mini_epoch: 256
+  shuffle: False
+
+  start_date: 2023-10-01T00:00
+  end_date: 2023-12-31T00:00
+  
+  # whether to track the exponential moving average of weights for validation
+  validate_with_ema: 
+    enabled : False
+    ema_ramp_up_ratio: 0.09
+    ema_halflife_in_thousands: 1e-3
+
+  # parameters for validation samples that are written to disk
+  output : {
+    # number of samples that are written
+    num_samples: 0,
+    # write samples in normalized model space
+    normalized_samples: False,
+    # output streams to write; default all
+    streams: null,
+  }
+
+  # run validation before training starts (mainly for model development)
+  validate_before_training: False
+  
+# test config; full test config is merge of validation and test config
+# test config is used by default when running inference
+
+# Tags for experiment tracking
+# These tags will be logged in MLFlow along with completed runs for train, eval, val
+# The tags are free-form, with the following rules:
+# - tags should be primitive types (strings, numbers, booleans). NO lists or dictionaries
+# - tags should not duplicate existing config entries.
+# - try to reuse existing tags where possible. MLFlow does not like having too many unique tags
+# - do not use long strings in values (less than 20 characters is a good rule of thumb, we may enforce this in the future)
+wgtags:
+  # The name of the organization of the person running the experiment.
+  # This may be autofilled in the future. Expected values are lowercase strings 
+  # e.g. "ecmwf", "cmcc", "metnor", "jsc", "escience"
+  org: uv
+  # The Github issue corresponding to this run (number such as 1234)
+  # Github issues are the central point when running experiment and contain 
+  # links to hedgedocs, code branches, pull requests etc.
+  # It is recommended to associate a run with a Github issue.
+  issue: null
+  # The name of the experiment. This is a distinctive codename for the experiment campaign being run.
+  # This is expected to be the primary tag for comparing experiments in MLFlow, along with the
+  # issue number.
+  # Expected values are lowercase strings with no spaces, just underscores:
+  # Examples: "rollout_ablation_grid"  
+  exp: e2_lejepa_teacherfree
+  # *** Experiment-specific tags ***
+  # All extra tags (including lists, dictionaries, etc.) are treated 
+  # as strings by mlflow, so treat all extra tags as simple string key: value pairs.
+  grid: null
+

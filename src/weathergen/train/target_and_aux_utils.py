@@ -4,6 +4,7 @@ from weathergen.common.config import Config, merge_configs
 from weathergen.model.ema import EMAModel
 from weathergen.model.model_interface import init_model_and_shard
 from weathergen.train.target_and_aux_module_base import PhysicalTargetAndAux
+from weathergen.train.target_and_aux_shared_encoder import SharedEncoderTarget
 from weathergen.train.target_and_aux_ssl_teacher import EMATeacher, FrozenTeacher
 from weathergen.train.teacher_utils import load_encoder_from_checkpoint, prepare_encoder_teacher
 
@@ -32,6 +33,11 @@ def get_target_aux_calculator(
     # create target_and_aux_calc
     if target_and_aux_calc == "Physical":
         target_aux = PhysicalTargetAndAux(loss_cfg, model)
+
+    elif target_and_aux_calc == "SharedEncoderTarget":
+        target_aux = SharedEncoderTarget(
+            model, cf.training_config, sigreg_cfg=cf.training_config.get("sigreg", None)
+        )
 
     elif target_and_aux_calc == "EMATeacher":
         # work around for problems with FSDP2
