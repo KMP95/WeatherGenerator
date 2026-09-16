@@ -284,7 +284,10 @@ training_config:
     num_projections: 256
     knots: 17
     t_max: 3.0
-    num_cells: 256        # cells/groups subsampled per step (0 = use all)
+    # 0 = regularise EVERY cell each step (12,288 tests). A subsample was the original
+    # default for cost, but it applies SIGReg to only ~2% of cells per step; the cost of
+    # all cells is ~1 GB of activations per rank, affordable on an 80 GB H100.
+    num_cells: 0
     min_samples: 4
     warmup_steps: 0
 
