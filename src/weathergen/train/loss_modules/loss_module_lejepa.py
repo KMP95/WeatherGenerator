@@ -432,5 +432,9 @@ class LossLatentSSLLeJEPA(LossLatentSSLStudentTeacher):
         sigreg = total / len(terms)
         losses_all["sigreg"] = sigreg.item()
         losses_all["sigreg_weight"] = self.sigreg_weight * warmup
+        # Peak GPU memory of this rank so far (GB): the number that decides how many
+        # weather states fit per GPU, i.e. the SIGReg sample count per node.
+        if torch.cuda.is_available():
+            losses_all["gpu_mem_peak_gb"] = torch.cuda.max_memory_allocated() / 1e9
 
         return LossValues(loss=loss, losses_all=losses_all, stddev_all=base.stddev_all)
