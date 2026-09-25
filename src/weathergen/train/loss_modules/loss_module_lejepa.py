@@ -51,7 +51,7 @@ the effective sample count whereas gradient accumulation does not.
 import logging
 
 import torch
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 
 from weathergen.train.loss_modules.loss_module_base import LossValues
 from weathergen.train.loss_modules.loss_module_ssl import LossLatentSSLStudentTeacher
@@ -183,7 +183,10 @@ class LossLatentSSLLeJEPA(LossLatentSSLStudentTeacher):
         # states) and ``state`` (sample axis = cells) are the two marginals of the
         # (state, cell) array; either alone is blind to the collapse along the other axis.
         agg = sr.get("aggregation", "cell")
-        self.aggregations = [str(a) for a in (agg if isinstance(agg, (list, tuple)) else [agg])]
+        if OmegaConf.is_list(agg) or isinstance(agg, (list, tuple)):
+            self.aggregations = [str(a) for a in agg]
+        else:
+            self.aggregations = [str(agg)]
         self.aggregation = self.aggregations[0]  # kept for messages / single-term paths
         tw = sr.get("term_weights", None) or {}
         self.term_weights = {a: float(tw.get(a, self.sigreg_weight)) for a in self.aggregations}
