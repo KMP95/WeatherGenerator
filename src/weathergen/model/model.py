@@ -788,6 +788,16 @@ class Model(torch.nn.Module):
         for i, inter in enumerate(intermediates):
             intermediates[i] = inter.reshape(shape).sum(axis=1)
 
+        # LeJEPA: expose the encoder output *before* the forecast engine, in the same
+        # normalised space the SSL targets live in. SIGReg with `sigreg.source: encoder`
+        # regularises this tensor (the one the targets are made of) instead of the
+        # post-forecast-engine latent state, and the collapse monitor's temporal-contrast
+        # metric compares it with the target-branch encoder output. A view, no copy.
+        output.add_latent_prediction(
+            0,
+            "encoder_tokens",
+            self.tokens_to_latent_state(self.latent_pre_norm(tokens), tokens).patch_tokens,
+        )
         # Allow for pushforward trick
         p_fwd = self.cf.training_config.get("forecast", {}).get("pushforward", False)
         # roll-out in latent space, iterate and generate output over requested output steps

@@ -88,6 +88,11 @@ class CollapseMonitor:
         self.singular_values_config = metrics_config.get("singular_values", {})
         self.dimension_variance_config = metrics_config.get("dimension_variance", {})
         self.cell_batch_variance_config = metrics_config.get("cell_batch_variance", {})
+        # Temporal contrast between the two branches' encoder outputs (needs
+        # preds.latent[0]["encoder_tokens"] and a target-branch tensor). Enabled by default.
+        self.temporal_contrast_config = metrics_config.get("temporal_contrast", {})
+        # Per-level (deep-SSL tap) target metrics. Off by default: one gather per level.
+        self.deep_levels_config = metrics_config.get("deep_levels", {"enabled": False})
         self.prototype_entropy_config = metrics_config.get("prototype_entropy", {})
         self.ema_beta_config = metrics_config.get("ema_beta", {})
 
@@ -271,6 +276,9 @@ class CollapseMonitor:
         prototype_probs: torch.Tensor | None = None,
         ema_beta: float | None = None,
         loss_type: str | None = None,
+        encoder_tokens_student: torch.Tensor | None = None,
+        encoder_tokens_target: torch.Tensor | None = None,
+        deep_targets: list[torch.Tensor] | None = None,
     ) -> dict[str, float]:
         """
         Compute all enabled collapse monitoring metrics.
@@ -402,6 +410,28 @@ class CollapseMonitor:
         ):
             entropy = self._compute_prototype_entropy(prototype_probs)
             metrics["collapse.dino.prototype_entropy"] = entropy
+
+        # Temporal contrast between the context and target encodings of one trajectory
+        if (
+            self.temporal_contrast_config.get("enabled", True)
+            and encoder_tokens_student is not None
+            and encoder_tokens_target is not None
+        ):
+            for key, value in self._compute_temporal_contrast(
+                encoder_tokens_student, encoder_tokens_target
+            ).items():
+                metrics[f"collapse.{key}"] = value
+
+        # Per-level target metrics (deep-SSL taps): the final-level target is what
+        # `teacher` reports; the intermediate levels are only visible here.
+        if self.deep_levels_config.get("enabled", False) and deep_targets:
+            for i, level in enumerate(deep_targets):
+                if not isinstance(level, torch.Tensor):
+                    continue
+                for key, value in self._compute_cell_batch_variance(level).items():
+                    metrics[f"collapse.teacher_L{i}.{key}"] = value
+                for key, value in self._compute_dimension_variance(level).items():
+                    metrics[f"collapse.teacher_L{i}.{key}"] = value
 
         # Log EMA beta
         if self.ema_beta_config.get("enabled", True) and ema_beta is not None:
@@ -682,6 +712,14 @@ class CollapseMonitor:
         var_batch_per_cell = var_batch.mean(dim=-1)  # [N]
         mean_batch = var_batch.mean()
         mean_cells = var_cells.mean()
+        # Across-cell variance of each *individual* state, averaged over states -> the
+        # spatial variance a state actually carries. Unlike `var_cells` (which is computed
+        # on the batch-mean state and is driven to sigma^2/N by any per-cell centring, e.g.
+        # per-cell SIGReg), this denominator does not depend on N and is the right
+        # reference for the across-state variance: ratio ~1 healthy, >>1 every state is a
+        # near-constant field (global-code collapse), ~0 states are alike (frozen
+        # climatology).
+        var_spatial = z.var(dim=1, unbiased=True).mean()
 
         return {
             "cell_batch_var_mean": mean_batch.item(),
@@ -689,7 +727,52 @@ class CollapseMonitor:
             "cell_batch_var_max": var_batch_per_cell.max().item(),
             "cell_var_mean": mean_cells.item(),
             "batch_to_cell_var_ratio": (mean_batch / (mean_cells + 1e-12)).item(),
+            "state_spatial_var_mean": var_spatial.item(),
+            "batch_to_spatial_var_ratio": (mean_batch / (var_spatial + 1e-12)).item(),
             "num_states": float(num_states),
+        }
+
+    def _compute_temporal_contrast(
+        self, z_t: torch.Tensor, z_next: torch.Tensor
+    ) -> dict[str, float]:
+        """
+        How different the two branches' encodings of one trajectory are, relative to how
+        different weather states are from each other.
+
+            rho = mean_{s,c} ||z_t[s,c] - z_next[s,c]||^2  /  mean_c tr Cov_s(z_t[.,c])
+
+        The check for the one collapse a temporal objective invites and SIGReg cannot see:
+        the encoder keeping only what t and t+dt share (orography, land-sea mask, the date
+        features) and dropping the weather. Then z_t ~ z_next everywhere, the predictor is
+        the identity, the prediction loss is ~0 and the across-batch spread is still
+        non-degenerate. rho -> 0 is that failure; for a healthy encoder the 6-h change is a
+        sizeable fraction of the across-state spread (order 0.1-1).
+
+        Args:
+            z_t: context-branch encoder tokens [B, N, D] (same normalised space as z_next).
+            z_next: target-branch encoder tokens [B, N, D].
+        """
+        z_t = z_t.detach()
+        z_next = z_next.detach()
+        if z_t.dtype in (torch.bfloat16, torch.float16):
+            z_t = z_t.float()
+        if z_next.dtype in (torch.bfloat16, torch.float16):
+            z_next = z_next.float()
+        if z_t.ndim != 3 or z_t.shape != z_next.shape or z_t.numel() == 0:
+            return {}
+        if torch.isnan(z_t).any() or torch.isnan(z_next).any():
+            logger.warning("NaN in tensors for temporal contrast computation")
+            return {}
+        num = (z_t - z_next).square().sum(dim=-1).mean()  # mean over states and cells
+        z_all = self._gather_batch_across_ranks(z_t)
+        if z_all.shape[0] < 2:
+            return {}
+        den = z_all.var(dim=0, unbiased=True).sum(dim=-1).mean()  # tr Cov over states, mean over cells
+        num_all = self._gather_batch_across_ranks(num.reshape(1)).mean()
+        return {
+            "temporal_contrast": (num_all / (den + 1e-12)).item(),
+            "temporal_dist_sq": num_all.item(),
+            "temporal_state_spread": den.item(),
         }
 
     def _compute_prototype_entropy(self, probs: torch.Tensor) -> float:
@@ -769,6 +852,8 @@ class CollapseMonitor:
                         return extract_latent_tensor(latent_data[key])
             return None
 
+        encoder_tokens_target: torch.Tensor | None = None
+        deep_targets: list[torch.Tensor] | None = None
         # Find SSL loss type and extract teacher latents
         for _loss_name, target_aux in targets_and_auxs.items():
             if not hasattr(target_aux, "latent") or not target_aux.latent:
@@ -786,7 +871,19 @@ class CollapseMonitor:
                     loss_type = ssl_type
                     teacher_latent = extract_latent_tensor(target_latent_dict[ssl_type])
                     break
+            # Target-branch encoder tokens: published explicitly by SharedEncoderTarget;
+            # for an EMA teacher the identity JEPA target *is* the encoder output.
+            if "encoder_tokens" in target_latent_dict:
+                encoder_tokens_target = extract_latent_tensor(target_latent_dict["encoder_tokens"])
+            elif loss_type == "JEPA" and teacher_latent is not None:
+                encoder_tokens_target = teacher_latent
+            deep = getattr(target_aux, "latent_deep", None)
+            if isinstance(deep, dict) and "JEPA" in deep:
+                deep_targets = [extract_latent_tensor(t) for t in deep["JEPA"]]
 
+        encoder_tokens_student: torch.Tensor | None = None
+        if preds.latent and len(preds.latent) > 0 and "encoder_tokens" in preds.latent[0]:
+            encoder_tokens_student = extract_latent_tensor(preds.latent[0]["encoder_tokens"])
         # Extract student latents from predictions
         if preds.latent and len(preds.latent) > 0:
             # First, try SSL-specific keys (JEPA/DINO/iBOT) from first step
@@ -859,6 +956,9 @@ class CollapseMonitor:
                 prototype_probs=prototype_probs,
                 ema_beta=ema_beta,
                 loss_type=loss_type,
+                encoder_tokens_student=encoder_tokens_student,
+                encoder_tokens_target=encoder_tokens_target,
+                deep_targets=deep_targets,
             )
         else:
             logger.debug(

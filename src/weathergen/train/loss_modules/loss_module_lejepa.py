@@ -59,7 +59,7 @@ from weathergen.utils.train_logger import Stage
 
 logger = logging.getLogger(__name__)
 
-_AGGREGATIONS = ("cell", "parent", "global", "pooled", "class_token")
+_AGGREGATIONS = ("cell", "state", "parent", "global", "pooled", "class_token")
 
 
 def _gaussian_quadrature(knots: int, t_max: float, device, dtype):
@@ -146,9 +146,15 @@ class LossLatentSSLLeJEPA(LossLatentSSLStudentTeacher):
 
         sigreg:
           weight: 0.2
-          aggregation: cell        # cell | parent | global | pooled | class_token
+          aggregation: cell        # cell | state | parent | global | pooled | class_token,
+                                   # or a list, e.g. [cell, state] -- one test per axis
+          term_weights: {cell: 0.2, state: 0.2}   # optional per-term weights (default: weight)
+          target_branch: false     # also regularise the target-branch encoder tokens
+                                   # (SharedEncoderTarget.publish_encoder_tokens) -- E3
           parent_levels_up: 1      # only for aggregation=parent
-          source: latent_state     # latent_state | sigreg_proj | <loss_fcts head name>
+          source: latent_state     # latent_state (after the forecast engine) | encoder
+                                   # (before it -- the tensor the targets are made of) |
+                                   # sigreg_proj | <loss_fcts head name>
           num_projections: 256
           knots: 17
           t_max: 3.0
@@ -172,7 +178,20 @@ class LossLatentSSLLeJEPA(LossLatentSSLStudentTeacher):
 
         sr = mode_cfg.get("sigreg", None) or {}
         self.sigreg_weight = float(sr.get("weight", 0.2))
-        self.aggregation = str(sr.get("aggregation", "cell"))
+        # One aggregation (str) or several (list): each is an independent test along its
+        # own axis and enters the loss with its own weight. ``cell`` (sample axis = weather
+        # states) and ``state`` (sample axis = cells) are the two marginals of the
+        # (state, cell) array; either alone is blind to the collapse along the other axis.
+        agg = sr.get("aggregation", "cell")
+        self.aggregations = [str(a) for a in (agg if isinstance(agg, (list, tuple)) else [agg])]
+        self.aggregation = self.aggregations[0]  # kept for messages / single-term paths
+        tw = sr.get("term_weights", None) or {}
+        self.term_weights = {a: float(tw.get(a, self.sigreg_weight)) for a in self.aggregations}
+        # ``target_branch``: also regularise the target branch's encoder tokens
+        # (``targets.latent["encoder_tokens"]``, published by SharedEncoderTarget) by pooling
+        # them into the sample axis with the context tokens -- LeWorldModel applies SIGReg to
+        # every time step's embedding. Doubles N for the cell test.
+        self.target_branch = bool(sr.get("target_branch", False))
         self.parent_levels_up = int(sr.get("parent_levels_up", 1))
         self.source = str(sr.get("source", "latent_state"))
         self.num_projections = int(sr.get("num_projections", 256))
@@ -188,9 +207,10 @@ class LossLatentSSLLeJEPA(LossLatentSSLStudentTeacher):
         self.projector_seed = int(proj.get("seed", 1234))
         self._random_projector: torch.Tensor | None = None
 
-        assert self.aggregation in _AGGREGATIONS, (
-            f"Unknown sigreg.aggregation {self.aggregation!r}; expected one of {_AGGREGATIONS}."
-        )
+        for a in self.aggregations:
+            assert a in _AGGREGATIONS, (
+                f"Unknown sigreg.aggregation {a!r}; expected one of {_AGGREGATIONS}."
+            )
         assert self.projector_mode in ("none", "random", "learned"), (
             f"Unknown sigreg.projector.mode {self.projector_mode!r}."
         )
@@ -211,6 +231,12 @@ class LossLatentSSLLeJEPA(LossLatentSSLStudentTeacher):
 
     def _select_representation(self, preds) -> torch.Tensor | None:
         latent = preds.latent[0]
+        if self.source == "encoder":
+            # Encoder output before the forecast engine (published by Model.forward). This
+            # is the tensor the JEPA targets are made of; regularising it, rather than the
+            # post-forecast-engine latent state, closes the route where the encoder keeps
+            # the weather at a tiny amplitude and the forecast engine re-inflates it.
+            return latent.get("encoder_tokens", None)
         if self.source == "latent_state":
             state = latent.get("latent_state", None)
             if state is None:
@@ -274,19 +300,39 @@ class LossLatentSSLLeJEPA(LossLatentSSLStudentTeacher):
 
     # ---------------------------------------------------------------- SIGReg
 
+    def _compute_sigreg_terms(self, z: torch.Tensor) -> dict[str, torch.Tensor]:
+        """One statistic per configured aggregation, sharing the projection matrix."""
+        out: dict[str, torch.Tensor] = {}
+        for agg in self.aggregations:
+            self.aggregation = agg
+            stat = self._compute_sigreg(z)
+            if stat is not None:
+                out[agg] = stat
+        self.aggregation = self.aggregations[0]
+        return out
+
     def _compute_sigreg(self, z: torch.Tensor) -> torch.Tensor | None:
         if z.dim() != 3:
             logger.warning(
                 "SIGReg expects [views, cells, dim]; got %s. Skipping.", tuple(z.shape)
             )
             return None
-
         z = z.float()
         if self.projector_mode == "random":
             z = self._apply_random_projector(z)
-
         world_size = torch.distributed.get_world_size() if _dist_active() else 1
-
+        if self.aggregation == "state":
+            # One test per weather state with its C cells as the samples: the transpose of
+            # `cell`. Every state's cells live on one rank, so no cross-rank pooling; the
+            # statistic is averaged over the local states (and the directions).
+            proj = z @ self._draw_projections(z.shape[-1], z.device, z.dtype)  # [V, C, P]
+            return sigreg_from_projections(
+                proj.transpose(0, 1).contiguous(),
+                sample_dim=0,
+                knots=self.knots,
+                t_max=self.t_max,
+                cross_rank=False,
+            )
         if self.aggregation == "pooled":
             # Every (state, cell) pair is a sample: [1, V*C, D] with sample axis 1.
             proj = (z.reshape(-1, z.shape[-1]) @ self._draw_projections(
@@ -344,13 +390,44 @@ class LossLatentSSLLeJEPA(LossLatentSSLStudentTeacher):
             )
             return LossValues(loss=loss, losses_all=losses_all, stddev_all=base.stddev_all)
 
-        sigreg = self._compute_sigreg(z)
-        if sigreg is None:
+        if self.target_branch:
+            zt = None
+            if isinstance(getattr(targets, "latent", None), dict):
+                zt = targets.latent.get("encoder_tokens", None)
+            if zt is None:
+                logger.warning(
+                    "sigreg.target_branch is set but targets.latent has no 'encoder_tokens' "
+                    "(needs SharedEncoderTarget with publish_encoder_tokens); using the "
+                    "context branch only."
+                )
+            elif zt.shape == z.shape:
+                # Both branches' states become samples of the same test (LeWorldModel:
+                # SIGReg over all time steps). Draws from one trajectory are correlated,
+                # so this is fewer than 2N independent samples -- but close.
+                z = torch.cat([z, zt.to(z.dtype)], dim=0)
+            else:
+                logger.warning(
+                    "target-branch tokens %s do not match context tokens %s; skipping them.",
+                    tuple(zt.shape),
+                    tuple(z.shape),
+                )
+
+        terms = self._compute_sigreg_terms(z)
+        if not terms:
             return LossValues(loss=loss, losses_all=losses_all, stddev_all=base.stddev_all)
 
-        weight = self.sigreg_weight * warmup
-        loss = loss + weight * sigreg
+        total = 0.0
+        for agg, stat in terms.items():
+            w = self.term_weights[agg] * warmup
+            loss = loss + w * stat
+            total = total + stat
+            if len(terms) > 1:
+                losses_all[f"sigreg_{agg}"] = stat.item()
+                losses_all[f"sigreg_{agg}_weight"] = w
+        # `sigreg` stays the headline number: the single statistic, or the mean of the
+        # terms when several axes are regularised (each is ~1.05 under the null).
+        sigreg = total / len(terms)
         losses_all["sigreg"] = sigreg.item()
-        losses_all["sigreg_weight"] = weight
+        losses_all["sigreg_weight"] = self.sigreg_weight * warmup
 
         return LossValues(loss=loss, losses_all=losses_all, stddev_all=base.stddev_all)

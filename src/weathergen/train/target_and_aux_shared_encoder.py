@@ -76,7 +76,9 @@ Usage::
       losses:
         student-teacher:
           type: LossLatentSSLLeJEPA
-          target_and_aux_calc: { SharedEncoderTarget: { target_eval_mode: false } }
+          target_and_aux_calc: { SharedEncoderTarget: { target_eval_mode: false,
+                                                    detach_target: false,      # true = E2g
+                                                    publish_encoder_tokens: true } }
       sigreg:
         weight: 0.2          # must be > 0: it is the only thing preventing collapse
 """
@@ -97,9 +99,27 @@ logger = logging.getLogger(__name__)
 class SharedEncoderTarget(EncoderTeacher):
     """Targets from the live encoder, differentiable, with no teacher of any kind."""
 
-    def __init__(self, model, training_cfg, sigreg_cfg=None, target_eval_mode=False, **kwargs):
+    def __init__(
+        self,
+        model,
+        training_cfg,
+        sigreg_cfg=None,
+        target_eval_mode=False,
+        detach_target=False,
+        publish_encoder_tokens=True,
+        **kwargs,
+    ):
         super().__init__(model, training_cfg, **kwargs)
         self.target_eval_mode = bool(target_eval_mode)
+        # E2g: stop-gradient on the target (SimSiam-style). The encoder is still shared, so
+        # the target still moves -- but only through the student branch, never because the
+        # prediction loss reshapes it directly.
+        self.detach_target = bool(detach_target)
+        # Publish the target branch's normalised encoder tokens under
+        # ``targets.latent["encoder_tokens"]`` so that (a) SIGReg can regularise the target
+        # branch too (``sigreg.target_branch: true``, LeWorldModel Alg. 3) and (b) the
+        # collapse monitor can compute the temporal contrast between the two branches.
+        self.publish_encoder_tokens = bool(publish_encoder_tokens)
 
         # SIGReg is the only thing standing between this configuration and a constant
         # representation, so refuse to start if it is switched off. Failing here costs a
@@ -185,9 +205,13 @@ class SharedEncoderTarget(EncoderTeacher):
 
         The base class cannot be reused: its ``no_grad`` context is the thing this module
         exists to remove, and it wraps the call to ``forward_teacher`` rather than sitting
-        inside it.
+        inside it. With ``detach_target`` the context is put back (E2g).
         """
-        teacher_output = self.forward_teacher(model_params, batch)
+        if self.detach_target:
+            with torch.no_grad():
+                teacher_output = self.forward_teacher(model_params, batch)
+        else:
+            teacher_output = self.forward_teacher(model_params, batch)
         outputs = teacher_output.get_latent_prediction(0)
 
         targets = {}
@@ -208,6 +232,11 @@ class SharedEncoderTarget(EncoderTeacher):
         aux_outputs = [list(sample.meta_info.values())[0] for sample in batch.get_samples()]
 
         targets_out = TargetAuxOutput(batch.get_output_len(), batch.get_output_idxs())
+        if self.publish_encoder_tokens:
+            # Raw normalised patch tokens of the target state (the same tensor the identity
+            # JEPA head returns, kept under its own key so loss/monitor code can find it
+            # without knowing which SSL loss is configured).
+            targets["encoder_tokens"] = outputs["latent_state"].patch_tokens
         targets_out.latent = targets
         targets_out.latent_deep = deep_targets
         targets_out.aux_outputs = aux_outputs

@@ -36,7 +36,10 @@ def get_target_aux_calculator(
 
     elif target_and_aux_calc == "SharedEncoderTarget":
         target_aux = SharedEncoderTarget(
-            model, cf.training_config, sigreg_cfg=cf.training_config.get("sigreg", None)
+            model,
+            cf.training_config,
+            sigreg_cfg=cf.training_config.get("sigreg", None),
+            **dict(target_and_aux_calc_params or {}),
         )
 
     elif target_and_aux_calc == "EMATeacher":
