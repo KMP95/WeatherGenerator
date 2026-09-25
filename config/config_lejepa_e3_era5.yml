@@ -294,6 +294,7 @@ training_config:
     # default for cost, but it applies SIGReg to only ~2% of cells per step; the cost of
     # all cells is ~1 GB of activations per rank, affordable on an 80 GB H100.
     num_cells: 0
+    state_num_cells: 256    # state test on a sparse random cell subset per step (cells are correlated draws)
     min_samples: 4
     warmup_steps: 0
 

@@ -158,7 +158,9 @@ class LossLatentSSLLeJEPA(LossLatentSSLStudentTeacher):
           num_projections: 256
           knots: 17
           t_max: 3.0
-          num_cells: 256           # cells/groups subsampled per step (0 = all)
+          num_cells: 0             # cell test: cells/groups tested per step (0 = all)
+          state_num_cells: 256     # state/pooled tests: sparse cell subset per step (0 = all;
+                                   # not recommended, neighbouring cells are correlated)
           min_samples: 4
           warmup_steps: 0
           projector:
@@ -201,6 +203,15 @@ class LossLatentSSLLeJEPA(LossLatentSSLStudentTeacher):
         self.knots = int(sr.get("knots", 17))
         self.t_max = float(sr.get("t_max", 3.0))
         self.num_cells = int(sr.get("num_cells", 256))
+        # Cells are not independent samples of one field: neighbouring cells are
+        # correlated, so a test whose sample axis is the cells (`state`, `pooled`) sees far
+        # fewer independent draws than C and its null value is ~1.05 * C / N_eff instead of
+        # 1.05 (E2d, pooled over all cells, sat at 57-73 and could only go down by
+        # decorrelating the field). Testing a sparse random subset of cells, redrawn every
+        # step, keeps the samples far enough apart to be roughly independent: the null
+        # returns to ~1.05 and the term penalises a genuine global code (m identical
+        # values -> ~m), not spatial smoothness. 0 = all cells (not recommended).
+        self.state_num_cells = int(sr.get("state_num_cells", 256))
         self.min_samples = int(sr.get("min_samples", 4))
         self.warmup_steps = int(sr.get("warmup_steps", 0))
 
@@ -295,6 +306,15 @@ class LossLatentSSLLeJEPA(LossLatentSSLStudentTeacher):
             return z
         return z.reshape(v, c // group, group, d).mean(dim=2)
 
+    def _subsample_cells(self, z: torch.Tensor, m: int) -> torch.Tensor:
+        """Random subset of m cells (same on every rank, redrawn each step); m <= 0 = all."""
+        c = z.shape[1]
+        if m <= 0 or m >= c:
+            return z
+        gen = torch.Generator(device="cpu").manual_seed(0x5157 * 104_729 + self._step)
+        idx = torch.randperm(c, generator=gen)[:m]
+        return z.index_select(1, idx.to(z.device))
+
     def _draw_projections(self, dim: int, device, dtype) -> torch.Tensor:
         gen = torch.Generator(device="cpu").manual_seed(0x5157 * 1_000_003 + self._step)
         a = torch.randn(dim, self.num_projections, generator=gen, dtype=torch.float32)
@@ -328,7 +348,8 @@ class LossLatentSSLLeJEPA(LossLatentSSLStudentTeacher):
             # One test per weather state with its C cells as the samples: the transpose of
             # `cell`. Every state's cells live on one rank, so no cross-rank pooling; the
             # statistic is averaged over the local states (and the directions).
-            proj = z @ self._draw_projections(z.shape[-1], z.device, z.dtype)  # [V, C, P]
+            zs = self._subsample_cells(z, self.state_num_cells)
+            proj = zs @ self._draw_projections(zs.shape[-1], zs.device, zs.dtype)  # [V, m, P]
             return sigreg_from_projections(
                 proj.transpose(0, 1).contiguous(),
                 sample_dim=0,
@@ -337,9 +358,11 @@ class LossLatentSSLLeJEPA(LossLatentSSLStudentTeacher):
                 cross_rank=False,
             )
         if self.aggregation == "pooled":
-            # Every (state, cell) pair is a sample: [1, V*C, D] with sample axis 1.
-            proj = (z.reshape(-1, z.shape[-1]) @ self._draw_projections(
-                z.shape[-1], z.device, z.dtype
+            # Every (state, cell) pair is a sample: [1, V*m, D] with sample axis 1, on the
+            # same sparse cell subset as `state` (see state_num_cells).
+            zs = self._subsample_cells(z, self.state_num_cells)
+            proj = (zs.reshape(-1, zs.shape[-1]) @ self._draw_projections(
+                zs.shape[-1], zs.device, zs.dtype
             )).unsqueeze(0)
             return sigreg_from_projections(
                 proj, sample_dim=1, knots=self.knots, t_max=self.t_max, cross_rank=True
