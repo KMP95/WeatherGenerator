@@ -149,8 +149,8 @@ class LossLatentSSLLeJEPA(LossLatentSSLStudentTeacher):
           aggregation: cell        # cell | state | parent | global | pooled | class_token,
                                    # or a list, e.g. [cell, state] -- one test per axis
           term_weights: {cell: 0.2, state: 0.2}   # optional per-term weights (default: weight)
-          target_branch: false     # also regularise the target-branch encoder tokens
-                                   # (SharedEncoderTarget.publish_encoder_tokens) -- E3
+          target_branch: false     # false | true (pool both branches into one test) |
+                                   # separate (one test per branch, averaged) -- E3 / E3c
           parent_levels_up: 1      # only for aggregation=parent
           source: latent_state     # latent_state (after the forecast engine) | encoder
                                    # (before it -- the tensor the targets are made of) |
@@ -196,7 +196,19 @@ class LossLatentSSLLeJEPA(LossLatentSSLStudentTeacher):
         # (``targets.latent["encoder_tokens"]``, published by SharedEncoderTarget) by pooling
         # them into the sample axis with the context tokens -- LeWorldModel applies SIGReg to
         # every time step's embedding. Doubles N for the cell test.
-        self.target_branch = bool(sr.get("target_branch", False))
+        # ``target_branch``: false | true (pool both branches' states into one test, as
+        # LeWorldModel pools all time steps) | "separate" (test each branch on its own and
+        # average). Pooling the two views of one trajectory into a single test lets the
+        # network lower the statistic by making the pair *anti-correlated* (antithetic
+        # samples estimate a characteristic function with less variance than independent
+        # ones): E3 showed sigreg_cell sinking to 0.86 while the temporal contrast rose to
+        # 3.2 (rho ~ -0.5 between E(x_t) and E(x_{t+6h})). "separate" removes that incentive.
+        tb = sr.get("target_branch", False)
+        self.target_branch = str(tb).lower() if isinstance(tb, str) else bool(tb)
+        if self.target_branch not in (False, True, "pool", "separate"):
+            raise ValueError(f"sigreg.target_branch must be false|true|pool|separate, got {tb!r}")
+        if self.target_branch == "pool":
+            self.target_branch = True
         self.parent_levels_up = int(sr.get("parent_levels_up", 1))
         self.source = str(sr.get("source", "latent_state"))
         self.num_projections = int(sr.get("num_projections", 256))
@@ -416,8 +428,8 @@ class LossLatentSSLLeJEPA(LossLatentSSLStudentTeacher):
             )
             return LossValues(loss=loss, losses_all=losses_all, stddev_all=base.stddev_all)
 
+        zt = None
         if self.target_branch:
-            zt = None
             if isinstance(getattr(targets, "latent", None), dict):
                 zt = targets.latent.get("encoder_tokens", None)
             if zt is None:
@@ -426,19 +438,34 @@ class LossLatentSSLLeJEPA(LossLatentSSLStudentTeacher):
                     "(needs SharedEncoderTarget with publish_encoder_tokens); using the "
                     "context branch only."
                 )
-            elif zt.shape == z.shape:
-                # Both branches' states become samples of the same test (LeWorldModel:
-                # SIGReg over all time steps). Draws from one trajectory are correlated,
-                # so this is fewer than 2N independent samples -- but close.
-                z = torch.cat([z, zt.to(z.dtype)], dim=0)
-            else:
+            elif zt.shape != z.shape:
                 logger.warning(
                     "target-branch tokens %s do not match context tokens %s; skipping them.",
                     tuple(zt.shape),
                     tuple(z.shape),
                 )
+                zt = None
 
-        terms = self._compute_sigreg_terms(z)
+        if zt is not None and self.target_branch is True:
+            # Pooled: both branches' states become samples of the same test. Draws from
+            # one trajectory are correlated, and the network can exploit that (see the
+            # constructor comment); kept as an option for the comparison with LeWorldModel.
+            terms = self._compute_sigreg_terms(torch.cat([z, zt.to(z.dtype)], dim=0))
+        elif zt is not None and self.target_branch == "separate":
+            # Each branch is its own test with N samples; the statistics are averaged.
+            # No sample ever sees its own trajectory partner inside a test, so there is
+            # nothing to gain from anti-correlating the two encodings.
+            t_ctx = self._compute_sigreg_terms(z)
+            self._step -= 1  # same projections / cell subset for the target branch
+            t_tgt = self._compute_sigreg_terms(zt.to(z.dtype))
+            self._step += 1
+            terms = {k: 0.5 * (t_ctx[k] + t_tgt[k]) for k in t_ctx if k in t_tgt}
+            for k in t_ctx:
+                if k in t_tgt:
+                    losses_all[f"sigreg_{k}_ctx"] = t_ctx[k].item()
+                    losses_all[f"sigreg_{k}_tgt"] = t_tgt[k].item()
+        else:
+            terms = self._compute_sigreg_terms(z)
         if not terms:
             return LossValues(loss=loss, losses_all=losses_all, stddev_all=base.stddev_all)
 

@@ -268,7 +268,7 @@ training_config:
     #          across weather states.
     aggregation: [cell, state]      # E3: one test per axis (sample axis = states | cells)
     term_weights: {cell: 0.2, state: 0.2}
-    target_branch: true             # SIGReg on the target-branch encoder tokens too (both time steps)
+    target_branch: true   # true = pool both branches into one test (E3); separate = one test per branch (E3c)
     parent_levels_up: 1
 
     # Which tensor to regularize. "latent_state" = raw encoder output (2048-dim).
