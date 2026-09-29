@@ -304,10 +304,13 @@ def _masked_l1_loss_per_sample(
     """
 
     assert mask.shape[0] == student_patches.shape[0], (
-        "mask.shape[0], batch dimension, has to match batch dimension for student_patches."
+        "mask.shape[0], batch dimension, has to match batch dimension for student_patches: "
+        f"mask {tuple(mask.shape)}, student_patches {tuple(student_patches.shape)}, "
+        f"teacher_patches {tuple(teacher_patches.shape)}."
     )
     assert teacher_patches.shape[0] in (1, mask.shape[0]), (
-        "teacher_patches batch dimension must be 1 or match mask batch dimension."
+        "teacher_patches batch dimension must be 1 or match mask batch dimension: "
+        f"teacher_patches {tuple(teacher_patches.shape)}, mask {tuple(mask.shape)}."
     )
 
     if mask.sum() == 0:
@@ -330,7 +333,9 @@ def jepa_loss(
     student_patches_masked, student_masks, teacher_patches_masked, teacher_masks, temporal=False
 ):
     # TODO remove as we deal with batch dimension
-    assert teacher_masks.shape[0] == 1 or teacher_masks.shape[0] == student_masks.shape[0]
+    assert teacher_masks.shape[0] == 1 or teacher_masks.shape[0] == student_masks.shape[0], (
+        f"teacher_masks {tuple(teacher_masks.shape)} vs student_masks {tuple(student_masks.shape)}"
+    )
     student_masks = student_masks.squeeze(dim=1)
     teacher_masks = teacher_masks.squeeze(dim=1)
 
