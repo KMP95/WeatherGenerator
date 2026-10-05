@@ -102,6 +102,10 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
         # initialise healpix
         self.healpix_level = cf.healpix_level
         self.num_healpix_cells = 12 * 4**self.healpix_level
+        # online physical probe needs the raw input window of every sample (see online_probe.py)
+        self.keep_source_raw = bool(
+            (cf.get("train_logging", {}) or {}).get("online_probe", {}).get("enabled", False)
+        )
         self.masker = Masker(cf.healpix_level, stage, self.streams, self.mode_cfg)
         self.tokenizer = TokenizerMasking(cf.healpix_level, self.masker)
 
@@ -530,6 +534,7 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
             num_steps_input,
             num_output_steps,
             self.num_healpix_cells,
+            keep_source_raw=self.keep_source_raw,
         )
 
         stream_data = self._build_stream_data_input(

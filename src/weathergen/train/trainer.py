@@ -32,6 +32,7 @@ from weathergen.model.model_interface import (
 )
 from weathergen.model.utils import apply_fct_to_blocks, set_to_eval
 from weathergen.train.collapse_monitor import CollapseMonitor
+from weathergen.train.online_probe import OnlineProbe
 from weathergen.train.loss_calculator import LossCalculator
 from weathergen.train.lr_scheduler import LearningRateScheduler
 from weathergen.train.target_and_aux_ssl_teacher import EMATeacher
@@ -178,6 +179,8 @@ class Trainer(TrainerBase):
         # Initialize collapse monitor for SSL training
         collapse_config = cf.train_logging.get("collapse_monitoring", {})
         self.collapse_monitor = CollapseMonitor(collapse_config, None)  # device set later in run()
+        # Online linear probes of physical quantities (detached latents; own optimiser)
+        self.online_probe = OnlineProbe(train_logging.get("online_probe", None))
 
         if cf.train_logging.get("track_performance_metrics"):
             self.perf_tracker = ThroughputTracker(
@@ -271,6 +274,7 @@ class Trainer(TrainerBase):
 
         # Update collapse monitor device
         self.collapse_monitor.device = self.device
+        self.online_probe.setup(cf, self.device)
 
         # create data loaders
         self.dataset = MultiStreamDataSampler(cf, self.training_cfg, stage=TRAIN)
@@ -582,6 +586,8 @@ class Trainer(TrainerBase):
                     preds,
                     targets_and_auxs,
                 )
+            # Online physical probes (no gradient into the model)
+            self.online_probe.step(batch, preds, targets_and_auxs, TRAIN, self.cf.general.istep)
 
             self._log_terminal(bidx, mini_epoch, TRAIN)
             if bidx % self.train_logging.metrics == 0:
@@ -649,6 +655,7 @@ class Trainer(TrainerBase):
                                 self.model,
                             )
 
+                    self.online_probe.step(batch, preds, targets_and_auxs, VAL, bidx)
                     _ = self.loss_calculator_val.compute_loss(
                         preds=preds,
                         targets_and_aux=targets_and_auxs,
@@ -684,6 +691,7 @@ class Trainer(TrainerBase):
 
                 self._log_terminal(0, mini_epoch, VAL)
                 self._log(VAL)
+                self._log_collapse_metrics(VAL)
 
         # avoid that there is a systematic bias in the validation subset
         self.dataset_val.advance()
@@ -1142,6 +1150,7 @@ class Trainer(TrainerBase):
         Log cached collapse monitoring metrics.
         """
         metrics = self.collapse_monitor.get_cached_metrics()
+        metrics.update(self.online_probe.get_cached_metrics(stage))
         if metrics and is_root():
             metrics["num_samples"] = self.cf.general.istep
             self.train_logger.log_metrics(stage, metrics)

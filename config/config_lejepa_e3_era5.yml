@@ -130,6 +130,19 @@ train_logging:
   checkpoint: 500
   log_grad_norms: False
 
+  # Online linear probes of physical quantities from the detached encoder tokens
+  # (MotionJEPA: collapse is invisible in the loss, visible in feature probes).
+  # probe.<train|val>.state.<ch> : y_t from z_t          (slow + fast content)
+  # probe.<train|val>.tend.<ch>  : y_{t+6h}-y_t from (z_t, z_{t+6h})   (fast content)
+  # probe.<train|val>.tend_t.<ch>: y_{t+6h}-y_t from z_t alone
+  online_probe:
+    enabled: true
+    stream: ERA5_in
+    channels: [2t, 10u, 10v, z_500, t_850, u_850, v_850, q_850]
+    lr: 1.0e-3
+    compute_frequency: 10
+    max_cells: 2048
+
   # Collapse monitoring for SSL training (JEPA/DINO/iBOT)
   # Detects representation collapse via various metrics
   # For forecasting, supports sequences of latents with per-step and aggregate metrics

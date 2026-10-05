@@ -58,6 +58,7 @@ class StreamData:
         input_steps: int,
         output_steps: int,
         healpix_cells: int,
+        keep_source_raw: bool = False,
     ) -> None:
         """
         StreamData object
@@ -84,6 +85,9 @@ class StreamData:
         self.input_steps = input_steps
         self.output_steps = output_steps
         self.healpix_cells = healpix_cells
+        # Keep the raw input window in the training stage too (the online physical probe
+        # computes per-cell means from it; ~13 MB per sample at o96).
+        self.keep_source_raw = keep_source_raw
 
         self.source_is_spoof = [False for _ in range(self.input_steps)]
         self.target_is_spoof = [False for _ in range(self.output_steps)]
@@ -186,7 +190,7 @@ class StreamData:
 
         assert step < self.input_steps
 
-        if stage == TRAIN:
+        if stage == TRAIN and not self.keep_source_raw:
             del ss_raw
             ss_raw = None
 
