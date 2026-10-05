@@ -139,7 +139,7 @@ class StreamEmbedTransformer(torch.nn.Module):
         else:
             raise ValueError(f"Unknown mode: {mode}")
 
-        self.dropout_final = torch.nn.Dropout(0.1)
+        self.dropout_final = torch.nn.Dropout(dropout_rate)
 
     def forward_channels(self, x_in):
         peh = positional_encoding_harmonic
