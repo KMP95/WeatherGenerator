@@ -180,7 +180,7 @@ class Trainer(TrainerBase):
         collapse_config = cf.train_logging.get("collapse_monitoring", {})
         self.collapse_monitor = CollapseMonitor(collapse_config, None)  # device set later in run()
         # Online linear probes of physical quantities (detached latents; own optimiser)
-        self.online_probe = OnlineProbe(train_logging.get("online_probe", None))
+        self.online_probe = OnlineProbe(cf.train_logging.get("online_probe", None))
 
         if cf.train_logging.get("track_performance_metrics"):
             self.perf_tracker = ThroughputTracker(
