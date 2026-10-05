@@ -274,11 +274,12 @@ class Trainer(TrainerBase):
 
         # Update collapse monitor device
         self.collapse_monitor.device = self.device
-        self.online_probe.setup(cf, self.device)
 
         # create data loaders
         self.dataset = MultiStreamDataSampler(cf, self.training_cfg, stage=TRAIN)
         self.dataset_val = MultiStreamDataSampler(cf, self.validation_cfg, stage=VAL)
+        # after the samplers: they fill cf.streams[*].train/val_source_channels
+        self.online_probe.setup(cf, self.device)
 
         loader_params = {
             "batch_size": None,
