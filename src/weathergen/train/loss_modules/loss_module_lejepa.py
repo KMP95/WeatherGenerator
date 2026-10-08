@@ -152,9 +152,9 @@ class LossLatentSSLLeJEPA(LossLatentSSLStudentTeacher):
           target_branch: false     # false | true (pool both branches into one test) |
                                    # separate (one test per branch, averaged) -- E3 / E3c
           parent_levels_up: 1      # only for aggregation=parent
-          source: latent_state     # latent_state (after the forecast engine) | encoder
-                                   # (before it -- the tensor the targets are made of) |
-                                   # sigreg_proj | <loss_fcts head name>
+          source: latent_state     # latent_state | encoder: the SAME tensor in SSL (the
+                                   # forecast engine has no blocks unless forecast.policy
+                                   # is set) | sigreg_proj | <loss_fcts head name>
           num_projections: 256
           knots: 17
           t_max: 3.0
@@ -258,10 +258,10 @@ class LossLatentSSLLeJEPA(LossLatentSSLStudentTeacher):
     def _select_representation(self, preds) -> torch.Tensor | None:
         latent = preds.latent[0]
         if self.source == "encoder":
-            # Encoder output before the forecast engine (published by Model.forward). This
-            # is the tensor the JEPA targets are made of; regularising it, rather than the
-            # post-forecast-engine latent state, closes the route where the encoder keeps
-            # the weather at a tiny amplitude and the forecast engine re-inflates it.
+            # Encoder output published by Model.forward before the forecast-engine loop.
+            # In SSL configs (forecast.policy null) the engine has no blocks, so this is
+            # the same tensor as latent_state.patch_tokens; the two sources only differ
+            # when a policy builds a real engine.
             return latent.get("encoder_tokens", None)
         if self.source == "latent_state":
             state = latent.get("latent_state", None)
