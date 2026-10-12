@@ -107,7 +107,9 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
             (cf.get("train_logging", {}) or {}).get("online_probe", {}).get("enabled", False)
         )
         self.masker = Masker(cf.healpix_level, stage, self.streams, self.mode_cfg)
-        self.tokenizer = TokenizerMasking(cf.healpix_level, self.masker)
+        self.tokenizer = TokenizerMasking(
+            cf.healpix_level, self.masker, encode_source_times=cf.get("encode_source_times", True)
+        )
 
         forecast_cfg = FORECAST_DEFAULTS | OmegaConf.to_object(mode_cfg.get("forecast", {}))
         self.output_offset = forecast_cfg["offset"]

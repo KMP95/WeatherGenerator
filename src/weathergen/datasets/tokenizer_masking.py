@@ -40,12 +40,23 @@ def readerdata_to_torch(rdata: IOReaderData) -> IOReaderData:
     return rdata
 
 
+def _zero_times_source(times, time_win) -> torch.Tensor:
+    """Source time encoding with every column set to zero (same shape as encode_times_source)."""
+    return torch.zeros_like(encode_times_source(times, time_win))
+
+
 class TokenizerMasking(Tokenizer):
-    def __init__(self, healpix_level: int, masker: Masker):
+    def __init__(self, healpix_level: int, masker: Masker, encode_source_times: bool = True):
         super().__init__(healpix_level)
         self.masker = masker
         self.rng = None
         self.token_size = None
+        # encode_source_times=False writes zeros into the five time columns of every source
+        # token (year, day of year, minute of day, sin/cos of the window offset) instead of
+        # the values of encode_times_source. The token layout is unchanged, so a model
+        # trained either way loads the same embedders; the setting is read from the run
+        # config (top-level key `encode_source_times`) and therefore follows the checkpoint.
+        self.encode_source_times = encode_source_times
 
     def reset_rng(self, rng) -> None:
         """
@@ -158,7 +169,7 @@ class TokenizerMasking(Tokenizer):
             rdata,
             time_win,
             self.hpy_verts_rots_source[-1],
-            encode_times_source,
+            encode_times_source if self.encode_source_times else _zero_times_source,
         )
 
         return (source_tokens_cells, source_tokens_lens)
