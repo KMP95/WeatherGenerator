@@ -15,8 +15,8 @@ Representation collapse is not visible in the training loss (MotionJEPA, 2609.23
 "collapse is not visible in the training loss"), and a loss can keep falling while the
 latent drops exactly the features a forecast needs -- the fast ones. The only detector
 that catches this during training is a probe of known physical quantities from the frozen
-(detached) latent. Three small linear heads are trained alongside the SSL run with their
-own optimiser; no gradient reaches the encoder:
+(detached) latent. Three small linear heads are fitted alongside the SSL run; no gradient
+reaches the encoder:
 
   state   : z_t                 -> y_t          what the latent knows about the state at t
   tend    : [z_t, z_{t+dt}]     -> y_{t+dt}-y_t what the pair knows about the 6-h CHANGE
@@ -37,13 +37,35 @@ when ``train_logging.online_probe.enabled`` is set (~13 MB per sample at o96). P
 assigned to HEALPix cells exactly as the tokenizer does (nested ordering), so the probe's
 cell axis is the latent's cell axis.
 
+HOW THE HEADS ARE FITTED
+------------------------
+``mode: ridge`` (default). Every ``compute_frequency`` training steps the detached latents
+of ``max_cells`` cells and their targets are added to running second-moment statistics
+(sum x, sum x x^T, sum x y^T, sum y, n) with an exponential forgetting factor ``decay``,
+so the statistics follow the encoder as it changes (with decay 0.995 and one update per
+10 steps the memory is ~2000 optimiser steps, i.e. about two mini-epochs of 1024). At the
+first validation batch of each validation pass the heads are solved in closed form from
+the rank's own statistics: features standardised with the running
+mean and standard deviation, then ridge with ``ridge_lambda`` relative to unit-variance
+features. The heads are then applied unchanged to every validation batch. This is the
+same read-out as the offline mechanism tests (ridge R^2 on standardised tokens), and it
+is exact: no learning rate, no optimiser state, no dependence on the token scale.
+
+``mode: adam`` is the previous behaviour: Linear heads trained by Adam on the raw latent.
+It never converged on these tokens (the per-dimension variance ranges over four orders of
+magnitude and changes during the run), and reported NMSE ~1.0 for every arm, including
+runs whose tokens the offline ridge read at R^2 0.4-0.9. Kept for reference only.
+
 Config (under ``train_logging``)::
 
     online_probe:
       enabled: true
       stream: ERA5_in                    # stream whose raw input is probed (default: first)
       channels: [2t, 10u, 10v, z_500, t_850, u_850, v_850, q_850]
-      lr: 1.0e-3
+      mode: ridge                        # ridge | adam
+      decay: 0.995                       # ridge: forgetting factor per update
+      ridge_lambda: 0.05                 # ridge: penalty on standardised features
+      lr: 1.0e-3                         # adam only
       compute_frequency: 10              # every N optimiser steps (training); every batch in validation
       max_cells: 2048                    # random cell subset per step (cost control)
 
@@ -77,6 +99,14 @@ class OnlineProbe:
         self.stream = config.get("stream", None)
         self.channel_names = list(config.get("channels", ["2t", "10u", "10v", "z_500", "t_850", "u_850", "v_850", "q_850"]))
         self.lr = float(config.get("lr", 1e-3))
+        self.mode = str(config.get("mode", "ridge"))
+        assert self.mode in ("ridge", "adam"), f"online_probe.mode must be ridge|adam, got {self.mode!r}"
+        self.decay = float(config.get("decay", 0.995))
+        self.ridge_lambda = float(config.get("ridge_lambda", 0.05))
+        # ridge statistics per head: dict(n, sx [d], sxx [d,d], sxy [d,k], sy [k]) and the
+        # solved heads (mean, std, W, b) for the validation pass in progress
+        self._stats: dict[str, dict[str, torch.Tensor]] = {}
+        self._solved: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = {}
         self.compute_frequency = int(config.get("compute_frequency", 10))
         self.max_cells = int(config.get("max_cells", 2048))
         self.healpix_level: int | None = None
@@ -246,10 +276,23 @@ class OnlineProbe:
         targets = {"state": y_t, "tend": dy, "tend_t": dy}
 
         train = stage_key == "train"
-        with torch.set_grad_enabled(train):
+        if self.mode == "ridge":
+            if train:
+                for h in _HEADS:
+                    self._ridge_accumulate(h, inputs[h], targets[h])
+                return
+            if not self._solved:
+                self._ridge_solve()
+            if not self._solved:
+                return
+        with torch.set_grad_enabled(train and self.mode == "adam"):
             losses = []
             for h in _HEADS:
-                pred = self.heads[h](inputs[h])
+                if self.mode == "ridge":
+                    m, sd, w, b = self._solved[h]
+                    pred = ((inputs[h] - m) / sd) @ w + b
+                else:
+                    pred = self.heads[h](inputs[h])
                 err = (pred - targets[h]) ** 2
                 losses.append(err.mean())
                 acc = self._acc[stage_key][h]
@@ -261,10 +304,60 @@ class OnlineProbe:
                     a[1] += y[:, j].sum().item()
                     a[2] += (y[:, j] ** 2).sum().item()
                     a[3] += y.shape[0]
-            if train:
+            if train and self.mode == "adam":
                 self.optimizer.zero_grad(set_to_none=True)
                 torch.stack(losses).sum().backward()
                 self.optimizer.step()
+
+    # ------------------------------------------------------------------ ridge
+
+    def _ridge_accumulate(self, h: str, x: torch.Tensor, y: torch.Tensor) -> None:
+        """Add one batch of (x, y) rows to the decayed second-moment statistics of head h."""
+        x = x.detach().double()
+        y = y.detach().double()
+        st = self._stats.get(h)
+        if st is None:
+            d, k = x.shape[1], y.shape[1]
+            st = {
+                "n": torch.zeros((), dtype=torch.float64, device=x.device),
+                "sx": torch.zeros(d, dtype=torch.float64, device=x.device),
+                "sxx": torch.zeros(d, d, dtype=torch.float64, device=x.device),
+                "sxy": torch.zeros(d, k, dtype=torch.float64, device=x.device),
+                "sy": torch.zeros(k, dtype=torch.float64, device=x.device),
+            }
+            self._stats[h] = st
+        g = self.decay
+        st["n"].mul_(g).add_(float(x.shape[0]))
+        st["sx"].mul_(g).add_(x.sum(0))
+        st["sxx"].mul_(g).addmm_(x.T, x)
+        st["sxy"].mul_(g).addmm_(x.T, y)
+        st["sy"].mul_(g).add_(y.sum(0))
+
+    def _ridge_solve(self) -> None:
+        """Closed-form heads from the (rank-summed) statistics; stored until the pass ends."""
+        # Per-rank statistics only (no collective call: a rank whose batch yields no probe
+        # rows must never block the others). ~2e5 rows per rank is ample for a 2048-dim ridge.
+        for h in _HEADS:
+            st = self._stats.get(h)
+            if st is None:
+                continue
+            n, sx, sxx, sxy, sy = (st[k] for k in ("n", "sx", "sxx", "sxy", "sy"))
+            if float(n) < 2.0:
+                continue
+            m = sx / n
+            my = sy / n
+            cov = sxx / n - torch.outer(m, m)
+            sd = cov.diagonal().clamp(min=0).sqrt() + 1e-6
+            cxy = sxy / n - torch.outer(m, my)
+            corr = cov / torch.outer(sd, sd)
+            rhs = cxy / sd.unsqueeze(1)
+            a = corr + self.ridge_lambda * torch.eye(corr.shape[0], dtype=corr.dtype, device=corr.device)
+            try:
+                w = torch.linalg.solve(a, rhs)
+            except RuntimeError as e:  # singular even with the ridge: skip this pass
+                logger.warning("online_probe: ridge solve failed for head %s (%s).", h, e)
+                continue
+            self._solved[h] = (m.float(), sd.float(), w.float(), my.float())
 
     # ------------------------------------------------------------------ report
 
@@ -272,6 +365,8 @@ class OnlineProbe:
         """NMSE per head and channel over the accumulation window; clears the window."""
         stage_key = "train" if str(stage).lower().startswith("train") else "val"
         out: dict[str, float] = {}
+        if stage_key == "val":
+            self._solved = {}  # the next validation pass re-solves from the newer statistics
         acc = self._acc.pop(stage_key, None)
         if not acc:
             return out

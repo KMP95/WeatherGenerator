@@ -163,6 +163,8 @@ class LossLatentSSLLeJEPA(LossLatentSSLStudentTeacher):
                                    # not recommended, neighbouring cells are correlated)
           min_samples: 4
           warmup_steps: 0
+          queue_steps: 0           # cell/parent/global/class_token tests: also use the detached
+                                   # tokens of the last K steps as samples (N = 16 (1+K)); 0 = off
           projector:
             mode: none             # none | random | learned
             out_dim: 128           # random and learned
@@ -172,6 +174,17 @@ class LossLatentSSLLeJEPA(LossLatentSSLStudentTeacher):
     ``projector.mode: learned`` builds an MLP on the *model* (see model.py) and exposes
     its output as ``sigreg_proj``; set ``source: sigreg_proj`` to use it. ``random`` uses
     a fixed, non-learnable sketch computed here, which needs no model change.
+
+    ``queue_steps: K`` keeps the tokens of the last K steps (detached, bfloat16, one queue
+    per branch) and adds them to the sample axis of the tests whose samples are weather
+    states. With one state per GPU and 16 GPUs the across-time test judges its 16
+    gradient-carrying samples against 16 (1+K) samples instead of 16: the empirical
+    characteristic function is estimated from 64 (K=3) or 256 (K=15) draws, so the
+    statistic resolves variance differences between directions that 16 samples cannot
+    (the rank blind spot). The gradient reaches only the current step's tokens; its
+    per-sample magnitude is unchanged, because the statistic is scaled by the sample
+    count, so no learning-rate change is implied. Queue entries are at most K steps stale.
+    Memory: K x 50 MB per branch at o96 (12288 x 2048 bfloat16).
     """
 
     def __init__(self, cf: DictConfig, mode_cfg: DictConfig, stage: Stage, device: str, **losses):
@@ -226,6 +239,10 @@ class LossLatentSSLLeJEPA(LossLatentSSLStudentTeacher):
         self.state_num_cells = int(sr.get("state_num_cells", 256))
         self.min_samples = int(sr.get("min_samples", 4))
         self.warmup_steps = int(sr.get("warmup_steps", 0))
+        self.queue_steps = int(sr.get("queue_steps", 0))
+        # queues[(branch, aggregation)] -> list of detached [V, G, D] bfloat16 tensors
+        self._queues: dict[tuple[str, str], list[torch.Tensor]] = {}
+        self._queue_branch = "ctx"
 
         proj = sr.get("projector", None) or {}
         self.projector_mode = str(proj.get("mode", "none"))
@@ -397,16 +414,32 @@ class LossLatentSSLLeJEPA(LossLatentSSLStudentTeacher):
             )
             return None
 
+        z_store = z.detach().to(torch.bfloat16) if self.queue_steps > 0 else None
+        if self.queue_steps > 0:
+            # Stored tokens of earlier steps join the sample axis. The cell subset below is
+            # drawn from the same seed for every entry, so each group's test keeps its
+            # own cell across all samples.
+            queue = self._queues.get((self._queue_branch, self.aggregation), [])
+            if queue:
+                z = torch.cat([z] + [q.to(z.dtype) for q in queue], dim=0)
+
         if 0 < self.num_cells < groups:
             # Identical subset on every rank, so the reduced ECF stays per-group coherent.
             gen = torch.Generator(device="cpu").manual_seed(0x5157 * 7_919 + self._step)
             idx = torch.randperm(groups, generator=gen)[: self.num_cells]
             z = z.index_select(1, idx.to(z.device))
 
-        proj = z @ self._draw_projections(dim, z.device, z.dtype)  # [V, G', P]
-        return sigreg_from_projections(
+        proj = z @ self._draw_projections(dim, z.device, z.dtype)  # [V(1+K), G', P]
+        stat = sigreg_from_projections(
             proj, sample_dim=0, knots=self.knots, t_max=self.t_max, cross_rank=True
         )
+        if z_store is not None:
+            key = (self._queue_branch, self.aggregation)
+            queue = self._queues.setdefault(key, [])
+            queue.append(z_store)
+            del queue[: max(0, len(queue) - self.queue_steps)]
+            self._last_queue_n = z.shape[0] * world_size
+        return stat
 
     # ---------------------------------------------------------------- entry point
 
@@ -454,11 +487,15 @@ class LossLatentSSLLeJEPA(LossLatentSSLStudentTeacher):
         elif zt is not None and self.target_branch == "separate":
             # Each branch is its own test with N samples; the statistics are averaged.
             # No sample ever sees its own trajectory partner inside a test, so there is
-            # nothing to gain from anti-correlating the two encodings.
+            # nothing to gain from anti-correlating the two encodings. The queues are per
+            # branch for the same reason: a stored target token never meets its context.
+            self._queue_branch = "ctx"
             t_ctx = self._compute_sigreg_terms(z)
             self._step -= 1  # same projections / cell subset for the target branch
+            self._queue_branch = "tgt"
             t_tgt = self._compute_sigreg_terms(zt.to(z.dtype))
             self._step += 1
+            self._queue_branch = "ctx"
             terms = {k: 0.5 * (t_ctx[k] + t_tgt[k]) for k in t_ctx if k in t_tgt}
             for k in t_ctx:
                 if k in t_tgt:
@@ -482,6 +519,8 @@ class LossLatentSSLLeJEPA(LossLatentSSLStudentTeacher):
         sigreg = total / len(terms)
         losses_all["sigreg"] = sigreg.item()
         losses_all["sigreg_weight"] = self.sigreg_weight * warmup
+        if self.queue_steps > 0:
+            losses_all["sigreg_queue_n"] = float(getattr(self, "_last_queue_n", 0))
         # Peak GPU memory of this rank so far (GB): the number that decides how many
         # weather states fit per GPU, i.e. the SIGReg sample count per node.
         if torch.cuda.is_available():
