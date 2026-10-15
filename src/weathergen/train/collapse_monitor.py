@@ -894,6 +894,19 @@ class CollapseMonitor:
                     loss_type = ssl_type
                     break
 
+            # With deep SSL enabled the loss never sees preds.latent[0]["JEPA"] (the head
+            # applied to the unfused final tokens): it trains the per-level projections of
+            # the head applied to the FUSED levels, preds.latent_deep[0]["JEPA"][i]. The
+            # unfused tensor is a dead end that shares weights with the trained path and
+            # can wander off (E2f-noclock: var_mean 600, rank 25, while JEPA_L0 = 0.05).
+            # Monitor the final-level prediction, the tensor the loss actually compares
+            # with the target-branch encoder tokens.
+            deep = getattr(preds, "latent_deep", None)
+            if loss_type == "JEPA" and deep:
+                deep0 = deep[0] if isinstance(deep, list) else deep
+                if isinstance(deep0, dict) and "JEPA" in deep0 and deep0["JEPA"]:
+                    student_latent = extract_latent_tensor(deep0["JEPA"][-1])
+
             # If no SSL keys found, extract from latent_state for all forecast steps
             if student_latent is None:
                 student_latents_list: list[torch.Tensor] = []
