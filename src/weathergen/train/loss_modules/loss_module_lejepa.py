@@ -121,7 +121,11 @@ def _all_gather_cat(x: torch.Tensor, dim: int = 0) -> torch.Tensor:
 
 
 def visreg_statistic(
-    z: torch.Tensor, directions: torch.Tensor, weights: dict[str, float], eps: float = 1e-6
+    z: torch.Tensor,
+    directions: torch.Tensor,
+    weights: dict[str, float],
+    eps: float = 1e-6,
+    detach_std: bool = False,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """VISReg regulariser on z = [N samples, G groups, D], one test per group.
 
@@ -134,6 +138,21 @@ def visreg_statistic(
               on random unit directions, sorted, and compared with the quantiles of N(0,1):
               the sliced 2-Wasserstein distance to the Gaussian.
     Returns the weighted sum averaged over groups and the three unweighted components.
+
+    Two departures from the paper's Algorithm 1, both forced by our regime, where the
+    across-date spread of a LayerNormed token starts at std ~ 0.08 per coordinate instead
+    of ~1 after a BatchNorm projector (smoke runs q77e3y7v, o32f9k4r, t1d0anmn collapsed
+    to a constant token within 64 steps at term weights 1, 10 and 40 alike):
+      * the plotting positions i/(N+1) sit INSIDE the expected order statistics of N normal
+        draws (for N = 4: 0.84 vs 1.03 for the largest), so the shape term systematically
+        asks the sorted sample to be narrower than it is;
+      * with the standardisation detached, that "narrower" request acts on z itself and is
+        hidden from the term at the next step by the fresh standardisation: a ratchet that
+        shrinks the spread every step, amplified by 1/std. The scale term's restoring force
+        (~2(1 - std)/N per element) loses to it once std is small.
+    So the quantile targets are Blom's unbiased plotting positions, and the standardisation
+    is NOT detached by default, which makes the shape term exactly scale-invariant: it can
+    only reshape the cloud, and the scale term alone decides its spread.
     """
     n = z.shape[0]
     mu = z.mean(dim=0, keepdim=True)  # [1, G, D]
@@ -141,11 +160,12 @@ def visreg_statistic(
     std = zc.std(dim=0, unbiased=False, keepdim=True)  # [1, G, D]
     l_center = mu.square().mean()
     l_scale = (1.0 - std).square().mean()
-    zn = zc / (std.detach() + eps)
+    zn = zc / ((std.detach() if detach_std else std) + eps)
     proj = zn @ directions  # [N, G, P]
     srt = proj.sort(dim=0).values
-    u = torch.arange(1, n + 1, device=z.device, dtype=z.dtype) / (n + 1)
-    q = torch.erfinv(2 * u - 1) * math.sqrt(2.0)  # standard-normal quantiles
+    i = torch.arange(1, n + 1, device=z.device, dtype=z.dtype)
+    u = (i - 0.375) / (n + 0.25)  # Blom plotting positions ~ expected normal order statistics
+    q = torch.erfinv(2 * u - 1) * math.sqrt(2.0)
     l_shape = (srt - q.view(n, 1, 1)).square().mean()
     total = (
         float(weights.get("center", 0.0)) * l_center
@@ -254,6 +274,7 @@ class LossLatentSSLLeJEPA(LossLatentSSLStudentTeacher):
           min_samples: 4
           warmup_steps: 0
           statistic: sigreg        # sigreg | visreg | sacreg, or per axis {cell: visreg, state: sacreg}
+          visreg_detach_std: false # paper detaches; false = shape term exactly scale-invariant
           visreg_weights: {center: 0.1, scale: 1.0, shape: 1.0}   # VISReg (Wu et al. 2026): three
                                    # decoupled terms; shape = sliced W2 to N(0,1) on standardised z
           sacreg_slice: 64         # SACReg (Demirel et al. 2026): slice width of the covariance
@@ -334,6 +355,7 @@ class LossLatentSSLLeJEPA(LossLatentSSLStudentTeacher):
             "scale": float(vw.get("scale", 1.0)),
             "shape": float(vw.get("shape", 1.0)),
         }
+        self.visreg_detach_std = bool(sr.get("visreg_detach_std", False))
         self.sacreg_slice = int(sr.get("sacreg_slice", 64))
         self.sacreg_eps = float(sr.get("sacreg_eps", 1e-4))
         self._components: dict[str, dict[str, float]] = {}
@@ -505,7 +527,9 @@ class LossLatentSSLLeJEPA(LossLatentSSLStudentTeacher):
         st = self.statistics[self.aggregation]
         if st == "visreg":
             a = self._draw_projections(dim, z_samples.device, z_samples.dtype)
-            total, comp = visreg_statistic(z_samples, a, self.visreg_weights)
+            total, comp = visreg_statistic(
+                z_samples, a, self.visreg_weights, detach_std=self.visreg_detach_std
+            )
         else:
             total, comp = sacreg_statistic(
                 z_samples, self.sacreg_slice, self.sacreg_eps, self._step
