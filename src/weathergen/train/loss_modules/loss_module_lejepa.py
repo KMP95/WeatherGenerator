@@ -173,6 +173,9 @@ class LossLatentSSLLeJEPA(LossLatentSSLStudentTeacher):
                                    # not recommended, neighbouring cells are correlated)
           min_samples: 4
           warmup_steps: 0
+          center: none             # none | ema: cell/parent/parent_pool tests judge z minus a
+          center_decay: 0.99       # per-cell running mean (detached, all-reduced), so a static
+                                   # part per cell is allowed and only the anomaly must be N(0, I)
           queue_steps: 0           # cell/parent/global/class_token tests: also use the detached
                                    # tokens of the last K steps as samples (N = 16 (1+K)); 0 = off
           projector:
@@ -233,6 +236,10 @@ class LossLatentSSLLeJEPA(LossLatentSSLStudentTeacher):
         if self.target_branch == "pool":
             self.target_branch = True
         self.parent_levels_up = int(sr.get("parent_levels_up", 1))
+        self.center_mode = str(sr.get("center", "none"))
+        assert self.center_mode in ("none", "ema"), f"sigreg.center must be none|ema, got {self.center_mode!r}"
+        self.center_decay = float(sr.get("center_decay", 0.99))
+        self._means: dict[tuple[str, str], torch.Tensor] = {}
         self.source = str(sr.get("source", "latent_state"))
         self.num_projections = int(sr.get("num_projections", 256))
         self.knots = int(sr.get("knots", 17))
@@ -350,6 +357,31 @@ class LossLatentSSLLeJEPA(LossLatentSSLStudentTeacher):
             return zg.permute(0, 2, 1, 3).reshape(v * group, c // group, d)
         return zg.mean(dim=2)
 
+    def _center_ema(self, z: torch.Tensor) -> torch.Tensor:
+        """Subtract a per-group running mean (detached) from z = [V, G, D].
+
+        The SIGReg statistic has no centering of its own: its sine term vanishes only for a
+        distribution symmetric about zero, so the per-cell test forbids any static part at a
+        cell (the climatology / geography the baseline keeps). With `center: ema` the test
+        judges the anomaly z - mean_c instead. The mean is an exponential running average
+        of the batch mean per group, averaged over ranks so every rank subtracts the same
+        vector, and updated only when gradients are enabled (training steps, not
+        validation). Gradient flows through z only; the queue stores centred tokens.
+        """
+        key = (self._queue_branch, self.aggregation)
+        bm = z.detach().float().mean(dim=0)  # [G, D]
+        if _dist_active():
+            torch.distributed.all_reduce(bm)
+            bm = bm / torch.distributed.get_world_size()
+        mu = self._means.get(key)
+        if mu is None or mu.shape != bm.shape:
+            mu = bm.clone()
+        elif torch.is_grad_enabled():
+            mu = mu.mul(self.center_decay).add_(bm, alpha=1.0 - self.center_decay)
+        if torch.is_grad_enabled() or key not in self._means:
+            self._means[key] = mu
+        return z - mu.to(z.dtype)
+
     def _subsample_cells(self, z: torch.Tensor, m: int) -> torch.Tensor:
         """Random subset of m cells (same on every rank, redrawn each step); m <= 0 = all."""
         c = z.shape[1]
@@ -413,6 +445,8 @@ class LossLatentSSLLeJEPA(LossLatentSSLStudentTeacher):
             )
 
         z = self._reduce_cells(z)
+        if self.center_mode == "ema" and self.aggregation in ("cell", "parent", "parent_pool"):
+            z = self._center_ema(z)
         views, groups, dim = z.shape
 
         n_eff = views * world_size
