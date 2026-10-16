@@ -59,6 +59,7 @@ the effective sample count whereas gradient accumulation does not.
 """
 
 import logging
+import math
 
 import torch
 from omegaconf import DictConfig, OmegaConf
@@ -107,6 +108,85 @@ def _all_reduce_sum(x: torch.Tensor) -> torch.Tensor:
     import torch.distributed.nn as dist_nn
 
     return dist_nn.all_reduce(x, op=torch.distributed.ReduceOp.SUM)
+
+
+def _all_gather_cat(x: torch.Tensor, dim: int = 0) -> torch.Tensor:
+    """Differentiable cross-rank concatenation along `dim` (identity without DDP)."""
+    if not _dist_active():
+        return x
+    import torch.distributed.nn
+
+    parts = torch.distributed.nn.all_gather(x.contiguous())
+    return torch.cat(list(parts), dim=dim)
+
+
+def visreg_statistic(
+    z: torch.Tensor, directions: torch.Tensor, weights: dict[str, float], eps: float = 1e-6
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """VISReg regulariser on z = [N samples, G groups, D], one test per group.
+
+    Three decoupled terms (Wu, Balestriero & Levine 2026, Algorithm 1):
+      center  mean over samples squared, averaged over coordinates;
+      scale   (1 - std_j)^2 per coordinate j, averaged -- unit variance PER COORDINATE, which
+              a low-rank, correlated code satisfies without spreading its variance over all
+              D directions (unlike the per-direction variance SIGReg's ECF test asks for);
+      shape   the batch is centred, divided by its per-coordinate std (stop-gradient), projected
+              on random unit directions, sorted, and compared with the quantiles of N(0,1):
+              the sliced 2-Wasserstein distance to the Gaussian.
+    Returns the weighted sum averaged over groups and the three unweighted components.
+    """
+    n = z.shape[0]
+    mu = z.mean(dim=0, keepdim=True)  # [1, G, D]
+    zc = z - mu
+    std = zc.std(dim=0, unbiased=False, keepdim=True)  # [1, G, D]
+    l_center = mu.square().mean()
+    l_scale = (1.0 - std).square().mean()
+    zn = zc / (std.detach() + eps)
+    proj = zn @ directions  # [N, G, P]
+    srt = proj.sort(dim=0).values
+    u = torch.arange(1, n + 1, device=z.device, dtype=z.dtype) / (n + 1)
+    q = torch.erfinv(2 * u - 1) * math.sqrt(2.0)  # standard-normal quantiles
+    l_shape = (srt - q.view(n, 1, 1)).square().mean()
+    total = (
+        float(weights.get("center", 0.0)) * l_center
+        + float(weights.get("scale", 1.0)) * l_scale
+        + float(weights.get("shape", 1.0)) * l_shape
+    )
+    return total, {"center": l_center.item(), "scale": l_scale.item(), "shape": l_shape.item()}
+
+
+def sacreg_statistic(
+    z: torch.Tensor, slice_width: int, eps: float, step_seed: int
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """SACReg on z = [N samples, G groups, D], one test per group (Demirel et al. 2026, Def. 3.5).
+
+    0.5 * ( |mu|^2 + tr(Sigma) - log det(Sigma + eps I) - d' ) / d', on a random orthonormal
+    slice of width d' (thin QR of a Gaussian matrix, shared by all groups, redrawn every step),
+    so that the covariance can be estimated from more samples than dimensions. Constrains only
+    the mean and the covariance spectrum: no Gaussian shape, so a uniform or U-shaped marginal
+    (longitude, latitude across cells) is not penalised. The log-det is a barrier against any
+    vanishing eigenvalue inside the slice, i.e. it demands full rank d' -- use it where the
+    samples really span that many directions (cells within a state), not for 16 dates.
+    """
+    n, g, d = z.shape
+    dp = min(slice_width, d, max(2, n - 1))
+    gen = torch.Generator(device="cpu").manual_seed(0x5AC * 1_000_003 + step_seed)
+    u, _ = torch.linalg.qr(torch.randn(d, dp, generator=gen, dtype=torch.float32))
+    u = u.to(device=z.device, dtype=z.dtype)
+    zs = z @ u  # [N, G, d']
+    mu = zs.mean(dim=0)  # [G, d']
+    zc = zs - mu.unsqueeze(0)
+    cov = torch.einsum("ngi,ngj->gij", zc, zc) / n  # [G, d', d']
+    eye = torch.eye(dp, device=z.device, dtype=z.dtype)
+    tr_ = cov.diagonal(dim1=-2, dim2=-1).sum(-1)
+    logdet = torch.logdet(cov + eps * eye)
+    per_group = 0.5 * (mu.square().sum(-1) + tr_ - logdet - dp) / dp
+    total = per_group.mean()
+    return total, {
+        "mean": (mu.square().sum(-1) / dp).mean().item(),
+        "trace": (tr_ / dp).mean().item(),
+        "logdet": (-logdet / dp).mean().item(),
+    }
 
 
 def sigreg_from_projections(
@@ -173,6 +253,11 @@ class LossLatentSSLLeJEPA(LossLatentSSLStudentTeacher):
                                    # not recommended, neighbouring cells are correlated)
           min_samples: 4
           warmup_steps: 0
+          statistic: sigreg        # sigreg | visreg | sacreg, or per axis {cell: visreg, state: sacreg}
+          visreg_weights: {center: 0.1, scale: 1.0, shape: 1.0}   # VISReg (Wu et al. 2026): three
+                                   # decoupled terms; shape = sliced W2 to N(0,1) on standardised z
+          sacreg_slice: 64         # SACReg (Demirel et al. 2026): slice width of the covariance
+          sacreg_eps: 1.0e-4       # log-det stabiliser; needs samples >= ~4 x slice width
           center: none             # none | ema: cell/parent/parent_pool tests judge z minus a
           center_decay: 0.99       # per-cell running mean (detached, all-reduced), so a static
                                    # part per cell is allowed and only the anomaly must be N(0, I)
@@ -236,6 +321,22 @@ class LossLatentSSLLeJEPA(LossLatentSSLStudentTeacher):
         if self.target_branch == "pool":
             self.target_branch = True
         self.parent_levels_up = int(sr.get("parent_levels_up", 1))
+        stat_cfg = sr.get("statistic", "sigreg")
+        if isinstance(stat_cfg, (dict, DictConfig)):
+            self.statistics = {a: str(stat_cfg.get(a, "sigreg")) for a in self.aggregations}
+        else:
+            self.statistics = {a: str(stat_cfg) for a in self.aggregations}
+        for a, st in self.statistics.items():
+            assert st in ("sigreg", "visreg", "sacreg"), f"sigreg.statistic[{a}]={st!r}"
+        vw = sr.get("visreg_weights", None) or {}
+        self.visreg_weights = {
+            "center": float(vw.get("center", 0.1)),
+            "scale": float(vw.get("scale", 1.0)),
+            "shape": float(vw.get("shape", 1.0)),
+        }
+        self.sacreg_slice = int(sr.get("sacreg_slice", 64))
+        self.sacreg_eps = float(sr.get("sacreg_eps", 1e-4))
+        self._components: dict[str, dict[str, float]] = {}
         self.center_mode = str(sr.get("center", "none"))
         assert self.center_mode in ("none", "ema"), f"sigreg.center must be none|ema, got {self.center_mode!r}"
         self.center_decay = float(sr.get("center_decay", 0.99))
@@ -399,6 +500,19 @@ class LossLatentSSLLeJEPA(LossLatentSSLStudentTeacher):
 
     # ---------------------------------------------------------------- SIGReg
 
+    def _alt_statistic(self, z_samples: torch.Tensor, dim: int) -> torch.Tensor | None:
+        """VISReg / SACReg on an assembled sample tensor [N, G, D] (all ranks' samples)."""
+        st = self.statistics[self.aggregation]
+        if st == "visreg":
+            a = self._draw_projections(dim, z_samples.device, z_samples.dtype)
+            total, comp = visreg_statistic(z_samples, a, self.visreg_weights)
+        else:
+            total, comp = sacreg_statistic(
+                z_samples, self.sacreg_slice, self.sacreg_eps, self._step
+            )
+        self._components[f"{self._queue_branch}:{self.aggregation}"] = comp
+        return total
+
     def _compute_sigreg_terms(self, z: torch.Tensor) -> dict[str, torch.Tensor]:
         """One statistic per configured aggregation, sharing the projection matrix."""
         out: dict[str, torch.Tensor] = {}
@@ -425,6 +539,9 @@ class LossLatentSSLLeJEPA(LossLatentSSLStudentTeacher):
             # `cell`. Every state's cells live on one rank, so no cross-rank pooling; the
             # statistic is averaged over the local states (and the directions).
             zs = self._subsample_cells(z, self.state_num_cells)
+            if self.statistics[self.aggregation] != "sigreg":
+                # samples = the m cells of each state (groups = the local states)
+                return self._alt_statistic(zs.transpose(0, 1).contiguous(), zs.shape[-1])
             proj = zs @ self._draw_projections(zs.shape[-1], zs.device, zs.dtype)  # [V, m, P]
             return sigreg_from_projections(
                 proj.transpose(0, 1).contiguous(),
@@ -478,10 +595,15 @@ class LossLatentSSLLeJEPA(LossLatentSSLStudentTeacher):
             idx = torch.randperm(groups, generator=gen)[: self.num_cells]
             z = z.index_select(1, idx.to(z.device))
 
-        proj = z @ self._draw_projections(dim, z.device, z.dtype)  # [V(1+K), G', P]
-        stat = sigreg_from_projections(
-            proj, sample_dim=0, knots=self.knots, t_max=self.t_max, cross_rank=True
-        )
+        if self.statistics[self.aggregation] != "sigreg":
+            # VISReg / SACReg need the raw samples, not the ECF: gather every rank's samples
+            # (differentiably) so the test sees V(1+K) x world_size weather states per group.
+            stat = self._alt_statistic(_all_gather_cat(z, dim=0), dim)
+        else:
+            proj = z @ self._draw_projections(dim, z.device, z.dtype)  # [V(1+K), G', P]
+            stat = sigreg_from_projections(
+                proj, sample_dim=0, knots=self.knots, t_max=self.t_max, cross_rank=True
+            )
         if z_store is not None:
             key = (self._queue_branch, self.aggregation)
             queue = self._queues.setdefault(key, [])
@@ -567,6 +689,12 @@ class LossLatentSSLLeJEPA(LossLatentSSLStudentTeacher):
         # terms when several axes are regularised (each is ~1.05 under the null).
         sigreg = total / len(terms)
         losses_all["sigreg"] = sigreg.item()
+        for key, comp in self._components.items():
+            branch, agg = key.split(":")
+            suffix = "" if branch == "ctx" else f"_{branch}"
+            for name, val in comp.items():
+                losses_all[f"{self.statistics[agg]}_{agg}_{name}{suffix}"] = val
+        self._components = {}
         losses_all["sigreg_weight"] = self.sigreg_weight * warmup
         if self.queue_steps > 0:
             losses_all["sigreg_queue_n"] = float(getattr(self, "_last_queue_n", 0))
