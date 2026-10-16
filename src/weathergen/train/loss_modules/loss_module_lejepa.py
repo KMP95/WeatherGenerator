@@ -34,6 +34,16 @@ the central design decision, and it is what `aggregation` selects:
             while keeping some locality. Valid because the model uses NESTED ordering,
             where a parent's children are contiguous (parent index = child index // 4^k).
 
+    parent_pool  one test per HEALPix level-(L-k) parent cell with the 4^k children x
+            weather states as the samples (no averaging): 64 samples per test for k=1,
+            256 for k=2, with 16 states. Between `cell` and `pooled`: the zero-mean demand
+            applies to the group's average over children and dates (static structure
+            coarser than the group is still forbidden), but static differences between
+            the children count as variance, and real spatial variation feeds the
+            variance demand instead of across-date variation alone. Implemented by
+            moving the children onto the sample axis, so the queue and the cross-rank
+            reduction apply unchanged.
+
     global  average over *all* cells to get one vector per weather state, then a single
             test with sample axis = weather states. This is the exact analogue of the
             image setting: one weather state <-> one image, cells <-> patch tokens, and
@@ -59,7 +69,7 @@ from weathergen.utils.train_logger import Stage
 
 logger = logging.getLogger(__name__)
 
-_AGGREGATIONS = ("cell", "state", "parent", "global", "pooled", "class_token")
+_AGGREGATIONS = ("cell", "state", "parent", "parent_pool", "global", "pooled", "class_token")
 
 
 def _gaussian_quadrature(knots: int, t_max: float, device, dtype):
@@ -146,12 +156,12 @@ class LossLatentSSLLeJEPA(LossLatentSSLStudentTeacher):
 
         sigreg:
           weight: 0.2
-          aggregation: cell        # cell | state | parent | global | pooled | class_token,
+          aggregation: cell        # cell | state | parent | parent_pool | global | pooled | class_token,
                                    # or a list, e.g. [cell, state] -- one test per axis
           term_weights: {cell: 0.2, state: 0.2}   # optional per-term weights (default: weight)
           target_branch: false     # false | true (pool both branches into one test) |
                                    # separate (one test per branch, averaged) -- E3 / E3c
-          parent_levels_up: 1      # only for aggregation=parent
+          parent_levels_up: 1      # for aggregation=parent and parent_pool
           source: latent_state     # latent_state | encoder: the SAME tensor in SSL (the
                                    # forecast engine has no blocks unless forecast.policy
                                    # is set) | sigreg_proj | <loss_fcts head name>
@@ -324,7 +334,7 @@ class LossLatentSSLLeJEPA(LossLatentSSLStudentTeacher):
             return z
         if self.aggregation == "global":
             return z.mean(dim=1, keepdim=True)
-        # parent: average the 4^k contiguous children of each level-(L-k) cell.
+        # parent / parent_pool: the 4^k contiguous children of each level-(L-k) cell.
         group = 4**self.parent_levels_up
         if c % group != 0:
             logger.warning(
@@ -333,7 +343,12 @@ class LossLatentSSLLeJEPA(LossLatentSSLStudentTeacher):
                 self.parent_levels_up,
             )
             return z
-        return z.reshape(v, c // group, group, d).mean(dim=2)
+        zg = z.reshape(v, c // group, group, d)
+        if self.aggregation == "parent_pool":
+            # children -> sample axis: [V*group, C/group, D]; sample j of view i is at
+            # row i*group + j, so the ECF over axis 0 pools children and states.
+            return zg.permute(0, 2, 1, 3).reshape(v * group, c // group, d)
+        return zg.mean(dim=2)
 
     def _subsample_cells(self, z: torch.Tensor, m: int) -> torch.Tensor:
         """Random subset of m cells (same on every rank, redrawn each step); m <= 0 = all."""

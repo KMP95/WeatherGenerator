@@ -274,6 +274,8 @@ training_config:
     # cell   : one test per HEALPix cell, samples = weather states (views x ranks).
     # parent : average the 4^k children of each level-(L-k) cell first, then one test
     #          per parent cell. k = parent_levels_up. Less noise, keeps locality.
+    # parent_pool : one test per level-(L-k) parent cell, samples = its 4^k children x
+    #          weather states (64 for k=1 with 16 states). Spatial neighbours as samples.
     # global : average over ALL cells -> one vector per weather state, one test.
     #          Exact analogue of the image setting (one image -> one embedding).
     # pooled : every (state, cell) pair is a sample. Reproduces
