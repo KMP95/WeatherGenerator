@@ -359,6 +359,10 @@ class LossLatentSSLLeJEPA(LossLatentSSLStudentTeacher):
         self.sacreg_slice = int(sr.get("sacreg_slice", 64))
         self.sacreg_eps = float(sr.get("sacreg_eps", 1e-4))
         self._components: dict[str, dict[str, float]] = {}
+        # Gradient-share monitor (trainer sets capture_terms=True on monitored steps): the
+        # weighted per-term loss tensors of the last compute_loss, with their graphs.
+        self.capture_terms = False
+        self.captured_terms: dict[str, torch.Tensor] = {}
         self.center_mode = str(sr.get("center", "none"))
         assert self.center_mode in ("none", "ema"), f"sigreg.center must be none|ema, got {self.center_mode!r}"
         self.center_decay = float(sr.get("center_decay", 0.99))
@@ -698,6 +702,8 @@ class LossLatentSSLLeJEPA(LossLatentSSLStudentTeacher):
                     losses_all[f"sigreg_{k}_tgt"] = t_tgt[k].item()
         else:
             terms = self._compute_sigreg_terms(z)
+        if self.capture_terms:
+            self.captured_terms = {"pred": base.loss}
         if not terms:
             return LossValues(loss=loss, losses_all=losses_all, stddev_all=base.stddev_all)
 
@@ -705,6 +711,8 @@ class LossLatentSSLLeJEPA(LossLatentSSLStudentTeacher):
         for agg, stat in terms.items():
             w = self.term_weights[agg] * warmup
             loss = loss + w * stat
+            if self.capture_terms:
+                self.captured_terms[f"sigreg_{agg}"] = w * stat
             total = total + stat
             if len(terms) > 1:
                 losses_all[f"sigreg_{agg}"] = stat.item()

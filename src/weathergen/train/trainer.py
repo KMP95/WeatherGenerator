@@ -176,6 +176,13 @@ class Trainer(TrainerBase):
         self.train_logger = TrainLogger(cf, config.get_path_run(self.cf))
         self._init_loss_spike_detection()
 
+        # Gradient-share monitor (lambda-JEPA's calibration quantity, online): every
+        # `every` steps, the gradient norm of each weighted loss term on the encoder and on
+        # the predictor, and each term's share of the encoder pull. See _log_grad_share.
+        gs = cf.train_logging.get("grad_share", {}) or {}
+        self.grad_share_enabled = bool(gs.get("enabled", False))
+        self.grad_share_every = int(gs.get("every", 100))
+
         # Initialize collapse monitor for SSL training
         collapse_config = cf.train_logging.get("collapse_monitoring", {})
         self.collapse_monitor = CollapseMonitor(collapse_config, None)  # device set later in run()
@@ -497,12 +504,20 @@ class Trainer(TrainerBase):
                         self.model,
                     )
 
+            monitor_grads = (
+                self.grad_share_enabled and self.cf.general.istep % self.grad_share_every == 0
+            )
+            if monitor_grads:
+                self._set_capture_terms(True)
             loss = self.loss_calculator.compute_loss(
                 preds=preds,
                 targets_and_aux=targets_and_auxs,
                 metadata=extract_batch_metadata(batch),
                 istep=self.cf.general.istep,
             )
+            if monitor_grads:
+                self._log_grad_share()
+                self._set_capture_terms(False)
             loss_value = self._get_tensor_item(loss.detach())
             if self._maybe_log_loss_spike(loss_value, batch, mini_epoch, bidx):
                 self._drop_latest_loss_record()
@@ -1145,6 +1160,70 @@ class Trainer(TrainerBase):
                 logger.info("\n")
 
             self.t_start = time.time()
+
+    # ------------------------------------------------------------- gradient-share monitor
+
+    def _lejepa_modules(self):
+        for _name, terms in self.loss_calculator.loss_calculators.items():
+            for _w, calc in terms:
+                if hasattr(calc, "capture_terms"):
+                    yield calc
+
+    def _set_capture_terms(self, flag: bool) -> None:
+        for calc in self._lejepa_modules():
+            calc.capture_terms = flag
+            if not flag:
+                calc.captured_terms = {}
+
+    def _log_grad_share(self) -> None:
+        """Per-term gradient norms on the encoder / predictor and the encoder pull shares.
+
+        Each weighted term captured by the loss module is differentiated separately with
+        torch.autograd.grad (graph retained for the real backward; nothing is accumulated
+        into .grad, so DDP's reducer is not touched). Norms are per rank; the squared norms
+        are averaged over ranks before logging. Keys: grad_share.<term>_enc,
+        grad_share.<term>_prd, grad_share.share_<term> (share of the summed encoder pull).
+        """
+        terms: dict[str, torch.Tensor] = {}
+        for calc in self._lejepa_modules():
+            terms.update(calc.captured_terms)
+        if not terms:
+            return
+        model = self.model.module if hasattr(self.model, "module") else self.model
+        enc = [p for p in model.encoder.parameters() if p.requires_grad]
+        prd_mods = [model.latent_heads]
+        for attr in ("deep_ssl_fusion", "deep_ssl_level_projections", "sigreg_projector"):
+            m = getattr(model, attr, None)
+            if m is not None:
+                prd_mods.append(m)
+        prd = [p for m in prd_mods for p in m.parameters() if p.requires_grad]
+        sq = {}
+        for name, t in terms.items():
+            if not torch.is_tensor(t) or not t.requires_grad:
+                continue
+            g = torch.autograd.grad(t, enc + prd, retain_graph=True, allow_unused=True)
+            e = sum((x.float().square().sum() for x in g[: len(enc)] if x is not None), 0.0)
+            q = sum((x.float().square().sum() for x in g[len(enc) :] if x is not None), 0.0)
+            sq[name] = (torch.as_tensor(e, device=self.device), torch.as_tensor(q, device=self.device))
+        if not sq:
+            return
+        vec = torch.stack([v for pair in sq.values() for v in pair]).float()
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.all_reduce(vec)
+            vec = vec / torch.distributed.get_world_size()
+        vals = vec.sqrt().tolist()
+        metrics: dict[str, float] = {}
+        enc_norms = {}
+        for i, name in enumerate(sq):
+            metrics[f"grad_share.{name}_enc"] = vals[2 * i]
+            metrics[f"grad_share.{name}_prd"] = vals[2 * i + 1]
+            enc_norms[name] = vals[2 * i]
+        tot = sum(enc_norms.values()) + 1e-30
+        for name, v in enc_norms.items():
+            metrics[f"grad_share.share_{name}"] = v / tot
+        if is_root():
+            metrics["num_samples"] = self.cf.general.istep
+            self.train_logger.log_metrics(TRAIN, metrics)
 
     def _log_collapse_metrics(self, stage: Stage) -> None:
         """

@@ -149,6 +149,12 @@ train_logging:
   # Enabled here (the TJEPA reference runs gjl6a0kb/uahdb9yl/n0t6ejuo all ran with this
   # off, so there are no rank/variance diagnostics for them). Turn it on in the TJEPA
   # baseline too if you want a like-for-like collapse comparison.
+  # Online gradient-share monitor: every `every` steps, the gradient norm of each weighted
+  # loss term (prediction, sigreg_cell, sigreg_state, ...) on the encoder and on the
+  # predictor, and each term's share of the encoder pull (grad_share.* in train metrics).
+  grad_share:
+    enabled: true
+    every: 100
   collapse_monitoring:
     enabled: True
     compute_frequency: 100  # batches between metric computations
