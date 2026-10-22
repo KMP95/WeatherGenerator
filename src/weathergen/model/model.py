@@ -350,6 +350,9 @@ class Model(torch.nn.Module):
         # Optional learnable projector applied before the LeJEPA SIGReg term. Stays None
         # unless training_config.sigreg.projector.mode == "learned".
         self.sigreg_projector: nn.Module | None = None
+        # G1 (LeWorldModel layout): projector after the predictor, same design as the
+        # SIGReg projector; the prediction loss is then computed in the projected space.
+        self.pred_projector: nn.Module | None = None
         # auxiliary tokens
         self.class_token_idxs = list(
             range(cf.num_register_tokens, cf.num_register_tokens + cf.num_class_tokens)
@@ -649,6 +652,19 @@ class Model(torch.nn.Module):
                     layers.append(nn.GELU())
             self.sigreg_projector = nn.Sequential(*layers)
 
+            g1_cfg = sigreg_cfg.get("g1", None) or {}
+            if g1_cfg.get("enabled", False):
+                # Same architecture as the encoder-side projector, separate weights
+                # (LeWorldModel: "The predictor is also followed by a projector network
+                # with the same implementation as the one used for the encoder").
+                layers = []
+                for i in range(len(dims) - 1):
+                    layers.append(nn.Linear(dims[i], dims[i + 1], bias=(i == len(dims) - 2)))
+                    if i < len(dims) - 2:
+                        layers.append(nn.LayerNorm(dims[i + 1]))
+                        layers.append(nn.GELU())
+                self.pred_projector = nn.Sequential(*layers)
+
         return self
 
     @staticmethod
@@ -852,7 +868,10 @@ class Model(torch.nn.Module):
 
         # latent predictions for SSL training
         for name, head in self.latent_heads.items():
-            output.add_latent_prediction(step, name, head(latent_state))
+            head_out = head(latent_state)
+            output.add_latent_prediction(step, name, head_out)
+            if self.pred_projector is not None and name == "JEPA" and self.deep_ssl_fusion is None:
+                output.add_latent_prediction(step, "pred_proj", self.pred_projector(head_out))
 
         # deep SSL: multi-level predictions (only at fstep 0, matching existing SSL)
         if intermediates and step == 0:
@@ -868,6 +887,11 @@ class Model(torch.nn.Module):
                     projections = self.deep_ssl_level_projections[name]
                     level_preds = [proj(predictor_out) for proj in projections]
                     output.add_deep_latent_prediction(step, name, level_preds)
+                    if self.pred_projector is not None and name == "JEPA":
+                        # G1: the final-level prediction mapped into the projected space
+                        output.add_latent_prediction(
+                            step, "pred_proj", self.pred_projector(level_preds[-1])
+                        )
             else:
                 # Teacher path: independent per-level prediction (no fusion)
                 level_preds_per_head: dict[str, list[torch.Tensor]] = {

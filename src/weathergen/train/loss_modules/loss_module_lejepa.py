@@ -273,6 +273,10 @@ class LossLatentSSLLeJEPA(LossLatentSSLStudentTeacher):
                                    # not recommended, neighbouring cells are correlated)
           min_samples: 4
           warmup_steps: 0
+          g1:                      # LeWorldModel layout (needs projector.mode: learned and
+            enabled: false         # source: sigreg_proj): prediction loss = MSE between the
+            weight: 1.0            # projected final-level prediction and the projected target
+            token_loss_weight: 0.0 # frame; the raw-token L1 levels are kept at this weight
           statistic: sigreg        # sigreg | visreg | sacreg, or per axis {cell: visreg, state: sacreg}
           visreg_detach_std: false # paper detaches; false = shape term exactly scale-invariant
           visreg_weights: {center: 0.1, scale: 1.0, shape: 1.0}   # VISReg (Wu et al. 2026): three
@@ -362,7 +366,12 @@ class LossLatentSSLLeJEPA(LossLatentSSLStudentTeacher):
         # Gradient-share monitor (trainer sets capture_terms=True on monitored steps): the
         # weighted per-term loss tensors of the last compute_loss, with their graphs.
         self.capture_terms = False
+        self._warned_keys: set[str] = set()
         self.captured_terms: dict[str, torch.Tensor] = {}
+        g1 = sr.get("g1", None) or {}
+        self.g1_enabled = bool(g1.get("enabled", False))
+        self.g1_weight = float(g1.get("weight", 1.0))
+        self.g1_token_loss_weight = float(g1.get("token_loss_weight", 0.0))
         self.center_mode = str(sr.get("center", "none"))
         assert self.center_mode in ("none", "ema"), f"sigreg.center must be none|ema, got {self.center_mode!r}"
         self.center_decay = float(sr.get("center_decay", 0.99))
@@ -642,9 +651,48 @@ class LossLatentSSLLeJEPA(LossLatentSSLStudentTeacher):
 
     # ---------------------------------------------------------------- entry point
 
+    def _g1_loss(self, preds, targets, losses_all) -> torch.Tensor | None:
+        """G1 prediction loss: MSE(pred_projector(prediction), projector(target frame)).
+
+        LeWorldModel's objective (Alg. 3): the tested tensor, the predicted tensor and the
+        representation are the same projected embedding, so content that passes the test
+        but cannot be predicted costs prediction error in every projected direction equally.
+        """
+        pp = preds.latent[0].get("pred_proj", None) if preds.latent else None
+        tp = targets.latent.get("sigreg_proj", None) if isinstance(getattr(targets, "latent", None), dict) else None
+        if pp is None or tp is None or pp.shape != tp.shape:
+            if "g1" not in self._warned_keys:
+                logger.warning(
+                    "sigreg.g1 enabled but pred_proj %s / target sigreg_proj %s missing or "
+                    "mismatched (needs projector.mode=learned, source=sigreg_proj and "
+                    "SharedEncoderTarget); G1 loss skipped.",
+                    None if pp is None else tuple(pp.shape),
+                    None if tp is None else tuple(tp.shape),
+                )
+                self._warned_keys.add("g1")
+            return None
+        pp = pp.float()
+        tp = tp.float()
+        mse = (pp - tp).square().mean()
+        losses_all["g1_mse"] = mse.item()
+        with torch.no_grad():
+            # spread of the two projected tensors across cells and states, per dimension:
+            # a collapsing prediction shows as g1_pred_var -> 0 with g1_tgt_var ~ 1
+            losses_all["g1_pred_var"] = pp.reshape(-1, pp.shape[-1]).var(0).mean().item()
+            losses_all["g1_tgt_var"] = tp.reshape(-1, tp.shape[-1]).var(0).mean().item()
+            # copy baseline: how far the projected target moved in 6 h (MSE of predicting
+            # the projected context), the G1 analogue of the temporal contrast
+            zc = preds.latent[0].get("sigreg_proj", None)
+            if zc is not None and zc.shape == tp.shape:
+                losses_all["g1_copy_mse"] = (zc.float() - tp).square().mean().item()
+        return mse
+
     def compute_loss(self, preds, targets, metadata, istep=0, **kwargs) -> LossValues:
         base = super().compute_loss(preds, targets, metadata, istep=istep, **kwargs)
         loss, losses_all = base.loss, dict(base.losses_all)
+        g1_mse = self._g1_loss(preds, targets, losses_all) if self.g1_enabled else None
+        if g1_mse is not None:
+            loss = self.g1_token_loss_weight * base.loss + self.g1_weight * g1_mse
 
         warmup = (
             min(1.0, self._step / self.warmup_steps) if self.warmup_steps > 0 else 1.0
@@ -663,7 +711,9 @@ class LossLatentSSLLeJEPA(LossLatentSSLStudentTeacher):
         zt = None
         if self.target_branch:
             if isinstance(getattr(targets, "latent", None), dict):
-                zt = targets.latent.get("encoder_tokens", None)
+                # with a projector the target frame is tested in the projected space too
+                key = "sigreg_proj" if self.source == "sigreg_proj" else "encoder_tokens"
+                zt = targets.latent.get(key, None)
             if zt is None:
                 logger.warning(
                     "sigreg.target_branch is set but targets.latent has no 'encoder_tokens' "
@@ -703,7 +753,12 @@ class LossLatentSSLLeJEPA(LossLatentSSLStudentTeacher):
         else:
             terms = self._compute_sigreg_terms(z)
         if self.capture_terms:
-            self.captured_terms = {"pred": base.loss}
+            if g1_mse is not None:
+                self.captured_terms = {"pred": self.g1_weight * g1_mse}
+                if self.g1_token_loss_weight > 0:
+                    self.captured_terms["pred_token"] = self.g1_token_loss_weight * base.loss
+            else:
+                self.captured_terms = {"pred": base.loss}
         if not terms:
             return LossValues(loss=loss, losses_all=losses_all, stddev_all=base.stddev_all)
 

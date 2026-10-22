@@ -180,6 +180,13 @@ class SharedEncoderTarget(EncoderTeacher):
             tokens_post_norm = m.latent_pre_norm(tokens)
             latent_state = m.tokens_to_latent_state(tokens_post_norm, tokens)
             output.add_latent_prediction(step, "latent_state", latent_state)
+            if getattr(m, "sigreg_projector", None) is not None:
+                # The target frame through the same encoder-side projector, with gradient:
+                # the SIGReg target branch and the G1 prediction target (LeWorldModel's
+                # z_{t+1} = projector(encoder(o_{t+1}))).
+                output.add_latent_prediction(
+                    step, "sigreg_proj", m.sigreg_projector(latent_state.patch_tokens)
+                )
             for name in m.latent_heads:
                 # identity head: the target is the raw patch tokens
                 output.add_latent_prediction(step, name, latent_state.patch_tokens)
@@ -237,6 +244,8 @@ class SharedEncoderTarget(EncoderTeacher):
             # JEPA head returns, kept under its own key so loss/monitor code can find it
             # without knowing which SSL loss is configured).
             targets["encoder_tokens"] = outputs["latent_state"].patch_tokens
+            if "sigreg_proj" in outputs:
+                targets["sigreg_proj"] = outputs["sigreg_proj"]
         targets_out.latent = targets
         targets_out.latent_deep = deep_targets
         targets_out.aux_outputs = aux_outputs

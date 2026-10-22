@@ -1192,7 +1192,7 @@ class Trainer(TrainerBase):
         model = self.model.module if hasattr(self.model, "module") else self.model
         enc = [p for p in model.encoder.parameters() if p.requires_grad]
         prd_mods = [model.latent_heads]
-        for attr in ("deep_ssl_fusion", "deep_ssl_level_projections", "sigreg_projector"):
+        for attr in ("deep_ssl_fusion", "deep_ssl_level_projections", "sigreg_projector", "pred_projector"):
             m = getattr(model, attr, None)
             if m is not None:
                 prd_mods.append(m)
