@@ -47,6 +47,21 @@ logger = logging.getLogger(__name__)
 type StreamName = str
 
 
+class TokenBatchNorm(nn.Module):
+    """BatchNorm1d over the token axis of a [..., D] tensor: statistics over every token of
+    the local batch (states x cells). LeWorldModel's projector normalises this way ("a
+    1-layer MLP with Batch Normalization ... necessary because the final ViT layer applies
+    a Layer Normalization"); selected with training_config.sigreg.projector.norm: batch."""
+
+    def __init__(self, dim: int):
+        super().__init__()
+        self.bn = nn.BatchNorm1d(dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        shape = x.shape
+        return self.bn(x.reshape(-1, shape[-1])).reshape(shape)
+
+
 class ModelOutput:
     """
     Representation of model output
@@ -644,11 +659,19 @@ class Model(torch.nn.Module):
         if proj_cfg.get("mode", "none") == "learned":
             dims = [cf.ae_global_dim_embed, *list(proj_cfg.get("hidden_dims", [2048])),
                     int(proj_cfg.get("out_dim", 128))]
+            proj_norm = str(proj_cfg.get("norm", "layer"))
+            assert proj_norm in ("layer", "batch"), (
+                f"sigreg.projector.norm must be layer|batch, got {proj_norm!r}"
+            )
+
+            def _norm(d: int) -> nn.Module:
+                return nn.LayerNorm(d) if proj_norm == "layer" else TokenBatchNorm(d)
+
             layers: list[nn.Module] = []
             for i in range(len(dims) - 1):
                 layers.append(nn.Linear(dims[i], dims[i + 1], bias=(i == len(dims) - 2)))
                 if i < len(dims) - 2:
-                    layers.append(nn.LayerNorm(dims[i + 1]))
+                    layers.append(_norm(dims[i + 1]))
                     layers.append(nn.GELU())
             self.sigreg_projector = nn.Sequential(*layers)
 
@@ -661,7 +684,7 @@ class Model(torch.nn.Module):
                 for i in range(len(dims) - 1):
                     layers.append(nn.Linear(dims[i], dims[i + 1], bias=(i == len(dims) - 2)))
                     if i < len(dims) - 2:
-                        layers.append(nn.LayerNorm(dims[i + 1]))
+                        layers.append(_norm(dims[i + 1]))
                         layers.append(nn.GELU())
                 self.pred_projector = nn.Sequential(*layers)
 

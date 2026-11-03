@@ -277,6 +277,13 @@ class LossLatentSSLLeJEPA(LossLatentSSLStudentTeacher):
             enabled: false         # source: sigreg_proj): prediction loss = MSE between the
             weight: 1.0            # projected final-level prediction and the projected target
             token_loss_weight: 0.0 # frame; the raw-token L1 levels are kept at this weight
+            pred_norm: none        # none | persistence: divide the projected MSE by the MSE of
+                                   # copying the projected context frame (ratio; denominator NOT
+                                   # detached): a token frozen in time or whitened leaves the
+                                   # ratio at 1, so neither shortcut lowers the loss
+            norm_eps: 1.0e-3       # added to the copy MSE in the ratio
+            min_change: 0.0        # floor on copy_mse / tgt_var (0 = off): adds
+            min_change_weight: 1.0 # min_change_weight * relu(min_change - copy_mse / tgt_var)
           statistic: sigreg        # sigreg | visreg | sacreg, or per axis {cell: visreg, state: sacreg}
           visreg_detach_std: false # paper detaches; false = shape term exactly scale-invariant
           visreg_weights: {center: 0.1, scale: 1.0, shape: 1.0}   # VISReg (Wu et al. 2026): three
@@ -292,6 +299,7 @@ class LossLatentSSLLeJEPA(LossLatentSSLStudentTeacher):
             mode: none             # none | random | learned
             out_dim: 128           # random and learned
             hidden_dims: [2048]    # learned only
+            norm: layer            # learned only: layer | batch (LeWorldModel: BatchNorm)
             seed: 1234             # random only
 
     ``projector.mode: learned`` builds an MLP on the *model* (see model.py) and exposes
@@ -372,6 +380,13 @@ class LossLatentSSLLeJEPA(LossLatentSSLStudentTeacher):
         self.g1_enabled = bool(g1.get("enabled", False))
         self.g1_weight = float(g1.get("weight", 1.0))
         self.g1_token_loss_weight = float(g1.get("token_loss_weight", 0.0))
+        self.g1_pred_norm = str(g1.get("pred_norm", "none"))
+        assert self.g1_pred_norm in ("none", "persistence"), (
+            f"sigreg.g1.pred_norm must be none|persistence, got {self.g1_pred_norm!r}"
+        )
+        self.g1_norm_eps = float(g1.get("norm_eps", 1.0e-3))
+        self.g1_min_change = float(g1.get("min_change", 0.0))
+        self.g1_min_change_weight = float(g1.get("min_change_weight", 1.0))
         self.center_mode = str(sr.get("center", "none"))
         assert self.center_mode in ("none", "ema"), f"sigreg.center must be none|ema, got {self.center_mode!r}"
         self.center_decay = float(sr.get("center_decay", 0.99))
@@ -679,13 +694,45 @@ class LossLatentSSLLeJEPA(LossLatentSSLStudentTeacher):
             # spread of the two projected tensors across cells and states, per dimension:
             # a collapsing prediction shows as g1_pred_var -> 0 with g1_tgt_var ~ 1
             losses_all["g1_pred_var"] = pp.reshape(-1, pp.shape[-1]).var(0).mean().item()
-            losses_all["g1_tgt_var"] = tp.reshape(-1, tp.shape[-1]).var(0).mean().item()
-            # copy baseline: how far the projected target moved in 6 h (MSE of predicting
-            # the projected context), the G1 analogue of the temporal contrast
-            zc = preds.latent[0].get("sigreg_proj", None)
-            if zc is not None and zc.shape == tp.shape:
-                losses_all["g1_copy_mse"] = (zc.float() - tp).square().mean().item()
-        return mse
+            tgt_var = tp.reshape(-1, tp.shape[-1]).var(0).mean()
+            losses_all["g1_tgt_var"] = tgt_var.item()
+        # copy baseline: how far the projected target moved over the offset (MSE of
+        # predicting the projected context), the G1 analogue of the temporal contrast.
+        # Kept in the graph: with pred_norm=persistence or min_change it is part of the loss.
+        zc = preds.latent[0].get("sigreg_proj", None)
+        copy = None
+        if zc is not None and zc.shape == tp.shape:
+            copy = (zc.float() - tp).square().mean()
+            losses_all["g1_copy_mse"] = copy.item()
+        g1 = mse
+        if self.g1_pred_norm == "persistence":
+            if copy is None:
+                if "g1_norm" not in self._warned_keys:
+                    logger.warning(
+                        "sigreg.g1.pred_norm=persistence but the projected context frame "
+                        "('sigreg_proj') is missing; using the plain MSE."
+                    )
+                    self._warned_keys.add("g1_norm")
+            else:
+                # Skill against persistence. With d = T(x_{t+dt}) - T(x_t) the change of
+                # the projected token and q the predicted change, the ratio
+                # |q - d|^2 / |d|^2 is unchanged when d is rescaled, so freezing the
+                # token in time (d -> 0, q -> 0) or whitening it (q -> mean) both leave
+                # the loss at 1; it falls below 1 only for change the predictor
+                # anticipates. The denominator carries gradient on purpose: detached,
+                # the numerator alone would still reward d -> 0.
+                g1 = mse / (copy + self.g1_norm_eps)
+                losses_all["g1_ratio"] = g1.item()
+        if self.g1_min_change > 0 and copy is not None:
+            # Floor on the relative change of the projected token over the offset
+            # (copy_mse / tgt_var; the fields' own 6-h contrasts are 0.1-0.9). The target
+            # variance is detached so the floor cannot be met by shrinking it.
+            floor = torch.relu(
+                self.g1_min_change - copy / (tgt_var.detach() + self.g1_norm_eps)
+            )
+            losses_all["g1_floor"] = floor.item()
+            g1 = g1 + self.g1_min_change_weight * floor
+        return g1
 
     def compute_loss(self, preds, targets, metadata, istep=0, **kwargs) -> LossValues:
         base = super().compute_loss(preds, targets, metadata, istep=istep, **kwargs)
