@@ -7,6 +7,7 @@
 # granted to it by virtue of its status as an intergovernmental organisation
 # nor does it submit to any jurisdiction.
 
+import copy
 import logging
 import pathlib
 from collections.abc import Sequence
@@ -137,6 +138,20 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
             self.teacher_time_offset = 0
 
         self.batch_size = get_batch_size_from_config(mode_cfg)
+        # batch_distinct_dates (off by default): the num_samples samples of a batch are drawn
+        # at DISTINCT dates instead of being views of one date, and every source sample k
+        # gets its own target sample k at idx_k + teacher_time_offset. A single GPU can then
+        # supply the across-date sample axis that otherwise only the DDP ranks provide (the
+        # per-cell SIGReg test, the collapse monitors and the online probe all read the local
+        # batch dimension as weather states). Inert at batch size 1.
+        self.batch_distinct_dates = (
+            bool(mode_cfg.get("batch_distinct_dates", False)) and self.batch_size > 1
+        )
+        if self.batch_distinct_dates and is_root():
+            logger.info(
+                f"batch_distinct_dates: the {self.batch_size} samples of a batch are drawn at "
+                "distinct dates (one view and one target per date)."
+            )
         self.shuffle = mode_cfg.shuffle
 
         self.len_timedelta = mode_cfg.time_window_len
@@ -177,7 +192,9 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
             // self.step_timedelta  # as number of indexs
         )
 
-        available_samples = max_index * self.batch_size  # as number of samples
+        # views per time window: batch_size views of one date, or one per date
+        views_per_window = 1 if self.batch_distinct_dates else self.batch_size
+        available_samples = max_index * views_per_window  # as number of samples
 
         assert available_samples > 0, (
             "There is an insufficient date range to \
@@ -298,7 +315,11 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
         perms = self._calc_baseperms(fsm)
 
         # rng changed, repeat if needed
-        n_requested_idxs = self.samples_per_mini_epoch // self.batch_size
+        n_requested_idxs = (
+            self.samples_per_mini_epoch
+            if self.batch_distinct_dates
+            else self.samples_per_mini_epoch // self.batch_size
+        )
         if self.repeat_data and len(perms) < n_requested_idxs:
             perms = np.tile(perms, n_requested_idxs // len(perms))
             filler = self.rng.choice(
@@ -802,6 +823,144 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
 
         return batch
 
+    def _get_batch_distinct_dates(self, idxs: list, num_forecast_steps: int):
+        """
+        Assemble one batch whose samples are drawn at distinct dates (batch_distinct_dates).
+
+        Sample k is the single view of date idxs[k] under source mask k; its target is the
+        view of idxs[k] + teacher_time_offset under the target mask that mask k corresponds
+        to. The masks are the ones build_samples_for_stream() produces for a batch of
+        len(idxs) views, so every masking strategy behaves as in the one-date path; only the
+        dates behind the views differ. Source k and target k are matched one-to-one.
+        """
+
+        mode = self.mode_cfg.get("training_mode")
+        source_cfgs = self.mode_cfg.get("model_input")
+        target_cfgs = self.mode_cfg.get("target_input", {})
+
+        masks_streams, num_source_samples, _ = self._get_source_target_masks(mode)
+        n = len(idxs)
+        assert num_source_samples == n, (num_source_samples, n)
+
+        source_select, target_select = [], []
+        if "masking" in mode:
+            source_select += ["network_input", "target_coords"]
+            target_select += ["target_values"]
+        if "student_teacher" in mode or "latent_loss" in mode:
+            source_select += ["network_input"]
+            target_select += ["network_input"]
+        source_select, target_select = list(set(source_select)), list(set(target_select))
+        if len(source_select) == 0 or len(target_select) == 0:
+            raise NotImplementedError(f"Unsupported training mode {mode}.")
+
+        num_output_steps = self._get_output_length(num_forecast_steps)
+        batch = ModelBatch(self.streams, n, n, self.output_offset, num_output_steps)
+
+        # The trainer selects target samples by target-config index; record which samples
+        # each config produced (see BatchSamples.config_sample_map).
+        target_num_samples = np.array([tc.get("num_samples", 1) for _, tc in target_cfgs.items()])
+        config_sample_map: dict[int, list[int]] = {}
+
+        input_steps = np.array([sc.get("num_steps_input", 1) for _, sc in source_cfgs.items()])
+        assert input_steps.min() == input_steps.max(), (
+            "Number of input steps has to be constant across configs."
+        )
+        assert input_steps.min(), "Number of input steps has to be greater than zero."
+        i_max = input_steps.max().item()
+
+        for stream_info, (stream_name, stream_ds) in zip(
+            self.streams, self.streams_datasets.items(), strict=True
+        ):
+            (target_masks, source_masks, source_to_target) = masks_streams[stream_name]
+            add_geoinfo_noise = "noise_time" in stream_info.get("geoinfo_channels", [])
+
+            for k, idx in enumerate(idxs):
+                (input_data, output_data) = self._get_data_windows(
+                    idx, num_forecast_steps, i_max, stream_ds
+                )
+                if self.teacher_time_offset > 0:
+                    (input_data_target, output_data_target) = self._get_data_windows(
+                        idx + self.teacher_time_offset, num_forecast_steps, i_max, stream_ds
+                    )
+                else:
+                    input_data_target, output_data_target = input_data, output_data
+
+                input_tokens = self.tokenizer.get_tokens_windows(stream_info, input_data, True)
+                output_tokens = self.tokenizer.get_tokens_windows(stream_info, output_data, False)
+                if self.teacher_time_offset > 0:
+                    input_tokens_target = self.tokenizer.get_tokens_windows(
+                        stream_info, input_data_target, True
+                    )
+                    output_tokens_target = self.tokenizer.get_tokens_windows(
+                        stream_info, output_data_target, False
+                    )
+                else:
+                    input_tokens_target, output_tokens_target = input_tokens, output_tokens
+
+                tidx = int(source_to_target[k])
+                source_meta = source_masks.metadata[k]
+                input_data_src = self.masker.apply_noise_to_data(
+                    input_data, source_meta, is_student=True, add_geoinfo_noise=add_geoinfo_noise
+                )
+                sdata = self._build_stream_data(
+                    source_select,
+                    idx,
+                    num_forecast_steps,
+                    stream_info,
+                    source_meta.params.get("num_steps_input", 1),
+                    input_data_src,
+                    output_data,
+                    input_tokens,
+                    output_tokens,
+                    output_mask=target_masks.masks[tidx],
+                    input_mask=source_masks.masks[k],
+                )
+                batch.add_source_stream(k, k, stream_name, sdata, source_meta)
+
+                # own copy of the metadata: the mask is attached per target sample
+                target_meta = copy.copy(target_masks.metadata[tidx])
+                target_mask = target_masks.masks[tidx]
+                input_data_tgt = self.masker.apply_noise_to_data(
+                    input_data_target,
+                    target_meta,
+                    is_student=False,
+                    add_geoinfo_noise=add_geoinfo_noise,
+                )
+                tdata = self._build_stream_data(
+                    target_select,
+                    idx + self.teacher_time_offset,
+                    num_forecast_steps,
+                    stream_info,
+                    target_meta.params.get("num_steps_input", 1),
+                    input_data_tgt,
+                    output_data_target,
+                    input_tokens_target,
+                    output_tokens_target,
+                    output_mask=target_mask,
+                    input_mask=target_mask,
+                )
+                target_meta.mask = target_mask
+                batch.add_target_stream(k, [k], stream_name, tdata, target_meta)
+
+                # config index of target mask tidx (masks are added per config, in order)
+                cfg_idx = (
+                    int(np.searchsorted(np.cumsum(target_num_samples), tidx, side="right"))
+                    if len(target_num_samples)
+                    else 0
+                )
+                samples_of_cfg = config_sample_map.setdefault(cfg_idx, [])
+                if k not in samples_of_cfg:
+                    samples_of_cfg.append(k)
+
+        batch.target_samples.config_sample_map = config_sample_map
+
+        source_in_steps = input_steps.max().item()
+        target_in_steps = np.array([tc.get("num_steps_input", 1) for _, tc in target_cfgs.items()])
+        target_in_steps = 1 if len(target_in_steps) == 0 else target_in_steps.max().item()
+        batch = self._preprocess_model_batch(batch, source_in_steps, target_in_steps)
+
+        return batch
+
     def __iter__(self) -> ModelBatch:
         """
         Return one batch of data
@@ -827,10 +986,17 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
             # use while loop due to the scattered nature of the data in time and to
             # ensure batches are not empty
             while True:
-                idx: TIndex = perms[idx_raw % perms.shape[0]]
-                idx_raw += 1
+                if self.batch_distinct_dates:
+                    # one window per sample: consecutive entries of the permutation
+                    idxs = [perms[(idx_raw + k) % perms.shape[0]] for k in range(self.batch_size)]
+                    idx_raw += self.batch_size
+                    idx = idxs[0]
+                    batch = self._get_batch_distinct_dates(idxs, num_forecast_steps)
+                else:
+                    idx: TIndex = perms[idx_raw % perms.shape[0]]
+                    idx_raw += 1
 
-                batch = self._get_batch(idx, num_forecast_steps)
+                    batch = self._get_batch(idx, num_forecast_steps)
 
                 # ensure the batch is valid, i.e. not completely empty and no NaN values
                 # student teacher has no classical targets

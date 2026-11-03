@@ -152,6 +152,12 @@ class BatchSamples:
         self.output_steps = output_steps
         self.output_idxs = output_idxs
         self.device = None
+        # Optional map {input-config index: [sample indices derived from it]}. The trainer
+        # selects target samples by the config index of target_source_correspondence, which
+        # coincides with the sample index only while every config yields one sample. The
+        # sampler's batch_distinct_dates mode (one target per date) sets this map so that a
+        # config index expands to all of its samples. None (default) keeps the identity.
+        self.config_sample_map: dict[int, list[int]] | None = None
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -174,14 +180,20 @@ class BatchSamples:
     def get_subset(self, subset: list | None = None):
         if subset is None:
             return self
-        else:
-            assert len(list(set(subset))) == len(subset), "subset contains duplicates"
-            # create copy and then select subset for samples and tokens_lens
-            bs = copy.deepcopy(self)
-            bs.samples = [bs.samples[i] for i in subset]
-            torch_idxs = torch.tensor(subset, dtype=torch.long, device=bs.tokens_lens.device)
-            bs.tokens_lens = torch.index_select(bs.tokens_lens, 1, torch_idxs)
-            return bs
+        if self.config_sample_map is not None:
+            expanded: list[int] = []
+            for c in subset:
+                expanded += self.config_sample_map.get(int(c), [int(c)])
+            subset = expanded
+            if sorted(subset) == list(range(len(self.samples))):
+                return self
+        assert len(list(set(subset))) == len(subset), "subset contains duplicates"
+        # create copy and then select subset for samples and tokens_lens
+        bs = copy.deepcopy(self)
+        bs.samples = [bs.samples[i] for i in subset]
+        torch_idxs = torch.tensor(subset, dtype=torch.long, device=bs.tokens_lens.device)
+        bs.tokens_lens = torch.index_select(bs.tokens_lens, 1, torch_idxs)
+        return bs
 
     def get_num_steps(self) -> int:
         """

@@ -1,0 +1,294 @@
+# (C) Copyright 2025 WeatherGenerator contributors.
+#
+# This software is licensed under the terms of the Apache Licence Version 2.0
+# which can be obtained at http://www.apache.org/licenses/LICENSE-2.0.
+#
+# In applying this licence, ECMWF does not waive the privileges and immunities
+# granted to it by virtue of its status as an intergovernmental organisation
+# nor does it submit to any jurisdiction.
+
+# PROXY of the team's temporal JEPA baseline (A1: EMA teacher, identity teacher head,
+# no SIGReg) for ONE GPU, see documentation/PROXY_PLAN.md. Identical model, data,
+# monitors and batch construction to proxy_lejepa_noclock_d0.yml so that the proxy
+# baseline is the reference for the proxy SIGReg arms. No clock, encoder dropout 0.
+
+embed_orientation: "channels"
+embed_unembed_mode: "block"
+embed_dropout_rate: 0
+
+ae_local_dim_embed: 128
+ae_local_num_blocks: 1
+ae_local_num_heads: 8
+ae_local_dropout_rate: 0
+ae_local_with_qk_lnorm: True
+
+ae_local_num_queries: 1
+ae_local_queries_per_cell: False
+ae_adapter_num_heads: 8
+ae_adapter_embed: 64
+ae_adapter_with_qk_lnorm: True
+ae_adapter_with_residual: True
+ae_adapter_dropout_rate: 0
+
+ae_global_dim_embed: 256
+ae_global_num_blocks: 3        # 3 so that the deep-SSL taps local2global, global:0, global:1 + final keep their meaning
+ae_global_num_heads: 8
+ae_global_dropout_rate: 0
+ae_global_with_qk_lnorm: True
+ae_global_att_dense_rate: 1.0
+ae_global_block_factor: 64
+ae_global_mlp_hidden_factor: 4
+ae_global_trailing_layer_norm: True
+
+ae_aggregation_num_blocks: 2
+ae_aggregation_num_heads: 8
+ae_aggregation_dropout_rate: 0
+ae_aggregation_with_qk_lnorm: True
+ae_aggregation_att_dense_rate: 1.0
+ae_aggregation_block_factor: 64
+ae_aggregation_mlp_hidden_factor: 4
+
+decoder_type: PerceiverIOCoordConditioning
+pred_adapter_kv: False
+pred_self_attention: True
+pred_dyadic_dims: False
+pred_mlp_adaln: True
+num_class_tokens: 0
+num_register_tokens: 16
+
+noise_pre_predictor_std: 0
+
+# no forecast engine in SSL (forecast.policy null); kept small for the config's sake
+fe_num_blocks: 2
+fe_num_heads: 8
+fe_dropout_rate: 0
+fe_with_qk_lnorm: True
+fe_layer_norm_after_blocks: [1]
+fe_impute_latent_noise_std: 0.0
+forecast_att_dense_rate: 1.0
+with_step_conditioning: True
+
+healpix_level: 5
+rope_2D: True
+mlp_type: swiglu
+use_xsa: True
+
+with_mixed_precision: True
+with_flash_attention: True
+compile_model: False
+with_fsdp: False
+ddp_find_unused_parameters: False
+attention_dtype: bf16
+mixed_precision_dtype: bf16
+mlp_norm_eps: 1e-5
+norm_eps: 1e-4
+
+latent_noise_kl_weight: 0.0
+latent_noise_gamma: 2.0
+latent_noise_saturate_encodings: 5
+latent_noise_use_additive_noise: False
+latent_noise_deterministic_latents: True
+
+freeze_modules: ""
+
+norm_type: "LayerNorm"
+qk_norm_type: "RMSNorm"
+zarr_store: "zip"
+
+# no clock: the five time columns of the source tokens are zeroed (the stream file has no
+# insolation / local-time / julian-day channels either)
+encode_source_times: False
+
+#####################################
+
+streams_directory: "./config/streams/proxy_era5_noclock/"
+streams: ???
+
+general:
+  istep: 0
+  rank: ???
+  world_size: ???
+  multiprocessing_method: "fork"
+  run_id: ???
+  run_history: []
+
+train_logging:
+  terminal: 10
+  metrics: 10
+  checkpoint: 500
+  log_grad_norms: False
+
+  # closed-form ridge probe (cross-year: fitted on the training dates, scored on the
+  # validation window); the first content check
+  online_probe:
+    enabled: true
+    stream: ERA5_in
+    channels: [2t, 10u, 10v, z_500, t_850, u_850, v_850, q_850]
+    lr: 1.0e-3
+    compute_frequency: 5
+    max_cells: 2048
+
+  grad_share:
+    enabled: false
+    every: 25
+  collapse_monitoring:
+    enabled: True
+    compute_frequency: 25
+    log_frequency: 25
+    metrics:
+      effective_rank:
+        enabled: true
+        tensor_source: "both"
+        sample_size: 2048
+        forecast_aggregation: "all"
+      singular_values:
+        enabled: true
+        tensor_source: "both"
+        sample_size: 2048
+        forecast_aggregation: "all"
+      dimension_variance:
+        enabled: true
+        tensor_source: "both"
+        forecast_aggregation: "all"
+      cell_batch_variance:
+        enabled: true
+        tensor_source: "both"
+        forecast_aggregation: "all"
+      temporal_contrast:
+        enabled: true
+      deep_levels:
+        enabled: true
+      prototype_entropy:
+        enabled: true
+      ema_beta:
+        enabled: true
+
+data_loading :
+  num_workers: 16
+  rng_seed: ???
+
+training_config:
+
+  training_mode: ["student_teacher"]
+  teacher_time_offset: 1
+
+  deep_ssl:
+    enabled: true
+    tap_after:
+      - local2global
+      - "global:0"
+      - "global:1"
+    fusion_hidden_factor: 4
+    level_weights: [0.25, 0.25, 0.25, 0.25]
+
+  context_loss:
+    enabled: false
+
+  num_mini_epochs: 16
+  samples_per_mini_epoch: 1024     # 64 batches of 16 dates; 16 workers x 4 batches
+  shuffle: True
+
+  # the 16 samples of a batch are 16 distinct dates (see the sampler); off = upstream views
+  batch_distinct_dates: true
+
+  start_date: 2015-01-01T00:00
+  end_date: 2022-12-31T00:00
+
+  time_window_step: 06:00:00
+  time_window_len: 06:00:00
+
+  window_offset_prediction : 0
+
+  learning_rate_scheduling :
+    lr_start: 1e-6
+    lr_max: 8e-5                   # x kappa = sqrt(16) = 3.2e-4, as on 4 nodes
+    lr_final_decay: 1e-6
+    lr_final: 0.0
+    num_steps_warmup: 64
+    num_steps_cooldown: 128
+    policy_warmup: "cosine"
+    policy_decay: "constant"
+    policy_cooldown: "linear"
+    parallel_scaling_policy: "sqrt"
+
+  optimizer:
+    grad_clip: 0.25
+    weight_decay: 0.05
+    adamw :
+      beta1 : 0.9875
+      beta2 : 0.994
+      eps : 2e-08
+
+  losses : {
+    "student-teacher": {
+        enabled: True,
+        type: LossLatentSSLStudentTeacher,
+        weight: 1.0,
+        loss_fcts : {
+          "JEPA": {
+            'weight': 1, "loss_extra_args": {temporal: true}, "out_dim": 256, "head": transformer,
+            "num_blocks": 2, "num_heads": 8, "with_qk_lnorm": True, "intermediate_dim": 128,
+            "dropout_rate": 0.1,
+            target_source_correspondence: {0 : {0 : "independent"} },
+        },
+        },
+        target_and_aux_calc: { "EMATeacher" :
+          { ema_ramp_up_ratio : null,
+            ema_halflife_in_thousands: 800000,
+            model_param_overrides : {
+              training_config: { losses: { student-teacher:{ loss_fcts :{JEPA: {head: identity} }}}}
+            },
+          }
+        }
+      }
+  }
+
+  model_input: {
+    "random_easy" : {
+      masking_strategy: "forecast",
+      num_samples: 16,             # = dates per batch with batch_distinct_dates
+      num_steps_input: 1,
+      masking_strategy_config : {},
+    },
+  }
+
+  target_input: {
+    "random_easy_target" : {
+      masking_strategy: "forecast",
+      num_samples: 1,
+      masking_strategy_config : {},
+    },
+  }
+
+  forecast :
+    time_step: 00:00:00
+    num_steps: 0
+    policy: null
+
+
+validation_config:
+
+  samples_per_mini_epoch: 256      # 16 batches of 16 dates
+  shuffle: True
+
+  start_date: 2023-10-01T00:00
+  end_date: 2023-12-31T00:00
+
+  validate_with_ema:
+    enabled : False
+    ema_ramp_up_ratio: 0.09
+    ema_halflife_in_thousands: 1e-3
+
+  output : {
+    num_samples: 0,
+    normalized_samples: False,
+    streams: null,
+  }
+
+  validate_before_training: False
+
+wgtags:
+  org: uv
+  issue: null
+  exp: proxy_a1_tjepa_noclock
+  grid: null
