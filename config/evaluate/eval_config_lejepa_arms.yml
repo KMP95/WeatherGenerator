@@ -1,0 +1,70 @@
+# FastEval (packages/evaluate, "WeatherGenerator-FastEvaluation") comparison of the LeJEPA
+# campaign arms: ONE evaluation job scoring all probe-inference runs together, so that the
+# summary line plots, ratio plots, heat maps, score cards and bar plots overlay the arms.
+#
+# Scores already cached under results/<inference run>/evaluation/*.json (rmse, mae, global)
+# are reused; the other metrics/regions are computed from the zarr outputs. Per-run maps are
+# not regenerated here: each arm's own evaluation wrote them to results/<inference run>/plots/ERA5/.
+#
+# Launch (login node, --run-ids is mandatory for the launcher and keeps only the listed entries):
+#   cd ~/WeatherGenerator; module load git/2.38.1-GCCcore-12.2.0-nodocs
+#   python3 ~/WeatherGenerator-private/hpc/scayle/launch-scayle.py --stage evaluation \
+#     --run-ids ml3v9zvd zdv6b9q8 mkpqx5tn oes4huc5 ed1zex41 zqrk8u00 biowk1cx igw4d9mf f66ez9sp sro5uvtf \
+#     --eval-config config/evaluate/eval_config_lejepa_arms.yml --nodes 1 --time 01:00:00 \
+#     --eval-options evaluation.summary_dir=<path_shared_working_dir>/plots/fasteval_lejepa_arms
+# Without the summary_dir override the summary plots land in ./plots/ of the job's snapshot
+# copy of the repository (the job runs with cwd = WEATHERGEN_HOME), which is hard to find later.
+
+evaluation:
+  metrics: ["rmse", "mae", "bias", "froct", "troct"]   # acc needs a climatology (climatology_path / data_path_aux): not available here yet
+  regions: ["global", "nhem", "shem", "tropics"]
+  summary_plots: true      # score vs lead time, one line per arm
+  ratio_plots: true        # each arm divided by the baseline
+  baseline: "ml3v9zvd"     # A1, the EMA-teacher reference arm
+  heat_maps: true          # lead time x channel
+  score_cards: true
+  bar_plots: true
+  summary_dir: "./plots/"
+  plot_ensemble: false
+  plot_score_maps: false
+  print_summary: false
+  log_scale: false
+  add_grid: true
+
+default_streams:
+  ERA5:
+    channels: ["2t", "10u", "10v", "z_500", "t_850", "u_850", "v_850", "q_850"]
+    evaluation:
+      forecast_step: "all"
+      sample: "all"
+      ensemble: "all"
+    plotting:
+      sample: [0]
+      forecast_step: [1, 4, 8, 12, 20]
+      plot_maps: false
+      plot_histograms: false
+      plot_animations: false
+
+# Inference runs (test_config.output.num_samples=16, forecast.num_steps=20) of the frozen-encoder
+# probes; the number in the label is the probe's final validation LossPhysical.loss_avg.
+run_ids:
+  ml3v9zvd:
+    label: "A1 (EMA teacher, 0.020)"
+  mkpqx5tn:
+    label: "B2 (0.045)"
+  oes4huc5:
+    label: "A1-4n (0.059)"
+  ed1zex41:
+    label: "E2f (0.079)"
+  zqrk8u00:
+    label: "B1 (0.111)"
+  biowk1cx:
+    label: "E3 (0.276)"
+  zdv6b9q8:
+    label: "E3c-d0 (0.298)"
+  igw4d9mf:
+    label: "E2b (0.301, floor)"
+  f66ez9sp:
+    label: "S02 (0.327, floor)"
+  sro5uvtf:
+    label: "V1 (0.309, floor)"
