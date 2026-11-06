@@ -19,9 +19,12 @@ evaluation:
   metrics: ["rmse", "mae", "bias", "froct", "troct"]   # acc needs a climatology (climatology_path / data_path_aux): not available here yet
   regions: ["global", "nhem", "shem", "tropics"]
   summary_plots: true      # score vs lead time, one line per arm
-  ratio_plots: true        # each arm divided by the baseline
+  ratio_plots: false       # each arm divided by the baseline, ONE FILE PER LEAD TIME (120 per metric and
+                           # region, 2400 in all); switch on for a single metric when wanted
   baseline: "ml3v9zvd"     # A1, the EMA-teacher reference arm
-  heat_maps: true          # lead time x channel
+  heat_maps: false         # lead time x channel. v1.0 bug: LinePlots.heat_map saves to self.out_plot_dir,
+                           # which its constructor never sets (AttributeError, job wlqd15vs); develop
+                           # fixed it with an alias to the line-plot directory
   score_cards: true
   bar_plots: true
   summary_dir: "./plots/"
