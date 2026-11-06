@@ -36,6 +36,25 @@ def _apply_xsa(attn_out: torch.Tensor, self_values: torch.Tensor) -> torch.Tenso
     return (attn_out_float - (proj * self_values_float)).to(attn_out.dtype)
 
 
+# CUDA grids allow at most 65535 blocks along the axis flash_attn_func uses for the batch,
+# and the kernel launch fails with "invalid configuration argument" above that. The batch
+# axis is independent in attention, so the call is split exactly, and only, when it would
+# fail: 16 ERA5 dates per GPU give 80640 tokens in the embedding network (the proxy setup).
+_FLASH_MAX_BATCH = 65535
+
+
+def _flash_attn_chunked(qs, ks, vs, **kwargs):
+    n = qs.shape[0]
+    if n <= _FLASH_MAX_BATCH:
+        return flash_attn_func(qs, ks, vs, **kwargs)
+    return torch.cat(
+        [
+            flash_attn_func(qs[i : i + _FLASH_MAX_BATCH], ks[i : i + _FLASH_MAX_BATCH], vs[i : i + _FLASH_MAX_BATCH], **kwargs)
+            for i in range(0, n, _FLASH_MAX_BATCH)
+        ]
+    )
+
+
 class MultiSelfAttentionHeadVarlen(torch.nn.Module):
     def __init__(
         self,
@@ -637,7 +656,7 @@ class MultiSelfAttentionHead(torch.nn.Module):
         dropout_rate = self.dropout_rate if self.training else 0.0
 
         # ordering of tensors (seq, heads, embed) (which differs from torch's flash attention implt)
-        outs = flash_attn_func(qs, ks, vs, softcap=self.softcap, dropout_p=dropout_rate)
+        outs = _flash_attn_chunked(qs, ks, vs, softcap=self.softcap, dropout_p=dropout_rate)
 
         if self.use_xsa:
             outs = _apply_xsa(outs, vs)
